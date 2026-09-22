@@ -1,0 +1,206 @@
+import OpenAI from 'openai';
+import fs from 'fs';
+import { env } from '../config/env';
+import { logger } from '../config/logger';
+
+const OPENAI_API_KEY = env.OPENAI_API_KEY || process.env.OPENAI_API_KEY || '';
+const openai = new OpenAI({
+  apiKey: OPENAI_API_KEY,
+  timeout: 20000,
+  maxRetries: 1,
+});
+
+export class OpenAIService {
+  /**
+   * Translates an audio file using Whisper STT
+   */
+  static async transcribeAudio(filePath: string): Promise<string> {
+    try {
+      const response = await openai.audio.translations.create({
+        file: fs.createReadStream(filePath),
+        model: 'whisper-1',
+        response_format: 'text',
+      });
+      return response as unknown as string;
+    } catch (error) {
+      logger.error(`OpenAI Transcription Error: ${error}`);
+      throw new Error('Failed to transcribe audio.');
+    }
+  }
+
+  /**
+   * Chat completion handler using OpenAI gpt-4o-mini
+   */
+  static async getChatCompletion(messages: any[], systemPrompt?: string): Promise<string> {
+    const apiMessages = systemPrompt 
+      ? [{ role: 'system', content: systemPrompt }, ...messages]
+      : messages;
+
+    try {
+      const response = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages: apiMessages,
+        temperature: 0.7,
+      });
+      return response.choices[0].message.content || '';
+    } catch (error: any) {
+      logger.error(`OpenAI Chat Error: ${error.message || error}`);
+      throw new Error('Failed to get chat completion.');
+    }
+  }
+
+  /**
+   * Quick Micro-Evaluation of a Single Answer for Adaptive Cutoff
+   */
+  static async evaluateSingleAnswer(questionText: string, userText: string): Promise<any> {
+    const prompt = `
+      You are a strict but fair tutor evaluator. Score the candidate's single response (1-10) against the question asked.
+
+      Question: "${questionText}"
+      Candidate Answer: "${userText}"
+
+      Rubric (1=Poor, 10=Excellent):
+      - clarity: logical, well-structured, easy to follow.
+      - warmth: supportive, encouraging, empathetic tone.
+      - simplicity: child-appropriate language without jargon.
+      - patience: how well the answer shows support for a struggling student.
+      - fluency: natural, coherent English with good sentence flow.
+      - engagement: how well they keep the listener hooked (voice dynamics via text proxy).
+
+      Also determine the responseQuality. Valid options are: "clear", "vague", "complex", "off-topic", or "unsatisfactory".
+      CRITICAL RULE: If the user provides an answer that is completely different from what was asked, ignores the scenario entirely, or is structurally unsatisfactory, label it strictly as "unsatisfactory" or "off-topic". 
+      If the response is extremely short (one-word) or silent, label it "vague" or "off-topic" accordingly.
+
+      Score fairly based only on this answer. Do not add extra commentary.
+      Return ONLY a raw JSON object matching this exact schema (no markdown, no extra text):
+      {
+        "clarity": 8,
+        "warmth": 9,
+        "simplicity": 7,
+        "patience": 8,
+        "fluency": 9,
+        "engagement": 8,
+        "average": 8.1,
+        "responseQuality": "clear"
+      }
+    `;
+
+    try {
+      const response = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages: [{ role: 'system', content: prompt }],
+        temperature: 0.1,
+      });
+
+      const content = response.choices[0].message.content || '{}';
+      const cleanContent = content.replace(/```json/g, '').replace(/```/g, '').trim();
+      return JSON.parse(cleanContent);
+    } catch (error) {
+      logger.error(`Single Answer Eval Error: ${error}`);
+      return { clarity: 5, warmth: 5, simplicity: 5, patience: 5, fluency: 5, engagement: 5, average: 5.0, responseQuality: "clear" };
+    }
+  }
+
+  /**
+   * JSON Structure Evaluator (Final Output)
+   */
+  static async evaluateInterview(messages: any[], userMessageCount?: number): Promise<any> {
+    const evaluationPrompt = `
+      You are an expert AI evaluator for tutor interviews. Review the following transcript.
+      
+      --------------------------------------------------
+      📊 EVALUATION
+      --------------------------------------------------
+      Provide a structured JSON output evaluating the candidate strictly on:
+      - clarity (1-10 scale rating, plus detailed reasoning)
+      - warmth (1-10)
+      - patience (1-10)
+      - simplicity (1-10)
+      - fluency (1-10)
+      - engagement (1-10 scale rating based on pacing and hooks)
+      
+      Additionally, include robust metadata:
+      - overallRecommendation ("PASS" or "FAIL")
+      - evidenceQuotes (array of at least 3 verbatim strings from the candidate)
+      - teachingStyle (string: 'example-driven', 'structured', 'unclear', 'authoritative', etc)
+      - riskFlags (array of strings, e.g., ["impatience", "vague", "jargon-heavy", "negative tone"])
+      - keyHighlights (array of strings praising specific good things they did)
+      - consistencyAnalysis (string summarizing if they improved or contradicted Governments/themselves)
+      - communicationStyleAnalysis (object with fields: structure (string), examplesUsed (boolean), stepByStep (boolean))
+
+      --------------------------------------------------
+      📏 SCORING GUIDELINES
+      --------------------------------------------------
+      10 = Excellent (clear, child-friendly, empathetic, fluent)
+      8 = Good (minor issues)
+      6 = Average (some clarity but inconsistent)
+      4 = Weak (struggles to communicate)
+      1-2 = Poor (not suitable for tutoring)
+
+      IMPORTANT RULES ABOUT INTERVIEW LENGTH:
+      - A complete interview consists of exactly 10 candidate responses.
+      - The candidate provided exactly ${userMessageCount ?? 'an unknown number of'} responses in this transcript.
+      - EARLY TERMINATION PENALTY: If the candidate answered 5 or fewer questions, you MUST heavily penalize ALL of their scores (maximum score of 4 for any category) and set overallRecommendation to "FAIL". Leaving an interview early or failing out early is an automatic failure, regardless of how good their few answers were.
+      - If they answered 6-9 questions, apply a moderate penalty across all scores and add "Incomplete Interview" to riskFlags.
+
+      OTHER IMPORTANT RULES:
+      - Use actual quotes from candidate responses in \`evidenceQuotes\`
+      - Identify subtle "risk flags" like long monologues or skipping steps
+      - Be fair, not overly harsh (unless the early termination penalty applies)
+
+      Return ONLY valid JSON in exactly this root-level schema shape (do NOT nest score/reasoning inside sub-objects arbitrarily, output exactly this):
+      {
+        "clarity": { "score": 8, "reasoning": "..." },
+        "simplicity": { "score": 7, "reasoning": "..." },
+        "patience": { "score": 9, "reasoning": "..." },
+        "warmth": { "score": 10, "reasoning": "..." },
+        "fluency": { "score": 8, "reasoning": "..." },
+        "engagement": { "score": 8, "reasoning": "..." },
+        "overallRecommendation": "PASS",
+        "evidenceQuotes": ["Quote 1 here", "Quote 2 here", "Quote 3 here"],
+        "teachingStyle": "example-driven",
+        "riskFlags": ["none"],
+        "keyHighlights": ["Used excellent pizza analogy"],
+        "consistencyAnalysis": "Candidate consistently maintained a warm tone...",
+        "communicationStyleAnalysis": {
+           "structure": "excellent, highly logical",
+           "examplesUsed": true,
+           "stepByStep": true
+        }
+      }
+    `;
+
+    try {
+      const response = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages: [
+          { role: 'system', content: evaluationPrompt },
+          ...messages
+        ],
+        temperature: 0.2,
+      });
+
+      const content = response.choices[0].message.content || '{}';
+      const cleanContent = content.replace(/```json/g, '').replace(/```/g, '').trim();
+      return JSON.parse(cleanContent);
+    } catch (error) {
+      logger.error(`OpenAI Eval Error: ${error}`);
+      return {
+        clarity: { score: 5, reasoning: "Evaluation generation failed." },
+        simplicity: { score: 5, reasoning: "Evaluation generation failed." },
+        patience: { score: 5, reasoning: "Evaluation generation failed." },
+        warmth: { score: 5, reasoning: "Evaluation generation failed." },
+        fluency: { score: 5, reasoning: "Evaluation generation failed." },
+        engagement: { score: 5, reasoning: "Evaluation generation failed." },
+        overallRecommendation: "FAIL",
+        evidenceQuotes: [],
+        teachingStyle: "unknown",
+        riskFlags: ["System fault"],
+        keyHighlights: [],
+        consistencyAnalysis: "Could not evaluate due to system error.",
+        communicationStyleAnalysis: { structure: "unknown", examplesUsed: false, stepByStep: false }
+      };
+    }
+  }
+}
+

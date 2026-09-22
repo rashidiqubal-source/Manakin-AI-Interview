@@ -1,0 +1,255 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id                   String                  @id @default(uuid())
+  email                String                  @unique
+  name                 String?
+  passwordHash         String?
+
+  emailVerified        Boolean                 @default(false)
+  role                 UserRole                @default(APPLICANT)
+  createdAt            DateTime                @default(now())
+  updatedAt            DateTime                @updatedAt
+
+  sessions             Session[]
+  emailVerifications   EmailVerificationToken[]
+  passwordResets       PasswordResetToken[]
+  jobDescriptions      JobDescription[]
+  interviewInvitations InterviewInvitation[]   @relation("RecruiterInvitations")
+  receivedInvitations  InterviewInvitation[]   @relation("ApplicantInvitations")
+  resumes              ApplicantResume[]
+}
+
+model Session {
+  id               String    @id @default(uuid())
+  userId           String
+  user             User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sessionTokenHash String    @unique
+  expiresAt        DateTime
+  createdAt        DateTime  @default(now())
+  lastUsedAt       DateTime  @default(now())
+  revokedAt        DateTime?
+  ipAddress        String?
+  userAgent        String?
+
+  @@index([userId])
+  @@index([sessionTokenHash])
+  @@index([expiresAt])
+}
+
+model EmailVerificationToken {
+  id        String    @id @default(uuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+  @@index([tokenHash])
+}
+
+model PasswordResetToken {
+  id        String    @id @default(uuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+  @@index([tokenHash])
+}
+
+model JobDescription {
+  id           String   @id @default(uuid())
+  recruiterId  String
+  recruiter    User     @relation(fields: [recruiterId], references: [id], onDelete: Cascade)
+  title        String
+  rawContent   String   @db.Text
+  aiSummary    String?  @db.Text
+  aiAnalysis   Json?
+  
+  // Section 1: Basic Job Information
+  department       String?
+  jobLevel         String?   // Intern, Entry Level, Mid Level, Senior, Lead, Manager
+  employmentType   String?   // Full-time, Part-time, Contract, Internship
+  openings         Int?      @default(1)
+  location         String?
+  workMode         String?   // On-site, Hybrid, Remote
+  joiningDate      String?
+
+  // Section 2: About the Job
+  shortSummary     String?   @db.Text
+  positionReason   String?   // New Position, Replacement, Business Expansion, Other
+
+  // Section 3: Responsibilities
+  responsibilities Json?     // Array of responsibility strings
+  dayToDayWork     String?   @db.Text
+
+  // Section 4: Required Skills
+  requiredSkills   Json?     // Array of { name, importance, proficiency }
+
+  // Section 5: Required Experience
+  minExperience        Float?   @default(0)
+  maxExperience        Float?
+  relevantExperience   String?
+  industryExperience   String?
+  freshersAllowed      Boolean? @default(false)
+  fresherRequirements  Json?    // Array of fresher requirement tags
+
+  // Section 6: Education Requirements
+  minEducation           String?  // No Requirement, Diploma, Bachelor's, Master's, PhD
+  requiredDegree         String?
+  cgpaRequirement        String?
+  certificationsRequired String?
+
+  // Section 7: Preferred Skills
+  preferredSkills         Json?    // Array of preferred skill strings
+  preferredExperience     String?  @db.Text
+  otherPreferredSkills    String?  @db.Text
+
+  // Section 8: Candidate Requirements & Qualities
+  candidateQualities  String?  @db.Text
+  languagesRequired   Json?    // Array of language strings
+  otherRequirements   String?  @db.Text
+
+  // Meta
+  isDraft      Boolean  @default(false)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  // Canonical Normalized JD & Intelligence Intelligence Fields
+  normalizedJD       Json?
+  interviewBlueprint Json?
+  contentHash        String?
+  analysisVersion    String?  @default("v2")
+
+  invitations  InterviewInvitation[]
+}
+
+model ApplicantResume {
+  id           String   @id @default(uuid())
+  applicantId  String
+  applicant    User     @relation(fields: [applicantId], references: [id], onDelete: Cascade)
+  fileName     String
+  rawContent   String   @db.Text
+  aiSummary    String?  @db.Text
+  aiAnalysis   Json?
+
+  // Canonical Normalized Resume & Intelligence Fields
+  normalizedResume   Json?
+  contentHash        String?
+  analysisVersion    String?  @default("v2")
+
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  invitations  InterviewInvitation[]
+}
+
+model InterviewInvitation {
+  id                 String           @id @default(uuid())
+  token              String           @unique @default(uuid())
+  jobDescriptionId   String
+  jobDescription     JobDescription   @relation(fields: [jobDescriptionId], references: [id], onDelete: Cascade)
+  recruiterId        String
+  recruiter          User             @relation("RecruiterInvitations", fields: [recruiterId], references: [id], onDelete: Cascade)
+  applicantEmail     String
+  applicantId        String?
+  applicant          User?            @relation("ApplicantInvitations", fields: [applicantId], references: [id], onDelete: SetNull)
+  applicantResumeId  String?
+  applicantResume    ApplicantResume? @relation(fields: [applicantResumeId], references: [id], onDelete: SetNull)
+  status             InvitationStatus @default(PENDING)
+  interviewSessionId String?          @unique
+  interviewSession   InterviewSession? @relation(fields: [interviewSessionId], references: [id], onDelete: SetNull)
+  createdAt          DateTime         @default(now())
+  updatedAt          DateTime         @updatedAt
+}
+
+enum UserRole {
+  RECRUITER
+  APPLICANT
+}
+
+enum InvitationStatus {
+  PENDING
+  ACCEPTED
+  IN_PROGRESS
+  COMPLETED
+  EXPIRED
+}
+
+model InterviewSession {
+  id                    String            @id @default(uuid())
+  candidateName         String
+  candidateEmail        String?
+  applicationStatus     ApplicationStatus @default(PENDING)
+  status                SessionStatus     @default(IN_PROGRESS)
+  overallRecommendation String?
+  totalScore            Float?            @default(0.0)
+  cheatCount            Int               @default(0)
+  evaluationData        Json?
+  questionBlueprint     Json?
+  feedback              String?
+  createdAt             DateTime          @default(now())
+  updatedAt             DateTime          @updatedAt
+
+  messages              Message[]
+  detectionEvents       DetectionEvent[]
+  invitation            InterviewInvitation?
+}
+
+model Message {
+  id                 String           @id @default(uuid())
+  interviewSessionId String
+  interviewSession   InterviewSession @relation(fields: [interviewSessionId], references: [id], onDelete: Cascade)
+  role               Role             // "system", "user", "assistant"
+  content            String
+  createdAt          DateTime         @default(now())
+
+  // Per-question micro-evaluation scores for candidate answers
+  clarity            Int?
+  warmth             Int?
+  simplicity         Int?
+  patience           Int?
+  fluency            Int?
+  engagement         Int?
+}
+
+enum SessionStatus {
+  IN_PROGRESS
+  COMPLETED
+}
+
+enum ApplicationStatus {
+  PENDING
+  ACCEPTED
+  REJECTED
+}
+
+enum Role {
+  system
+  user
+  assistant
+}
+
+model DetectionEvent {
+  id                 String           @id @default(uuid())
+  interviewSessionId String
+  interviewSession   InterviewSession @relation(fields: [interviewSessionId], references: [id], onDelete: Cascade)
+  eventType          String           // "FACE_ABSENCE", "MULTIPLE_FACES", "UNAUTHORIZED_DEVICE", "SUSPICIOUS_OBJECT"
+  objectClass        String?
+  confidence         Float?
+  riskLevel          String           // "HIGH", "MEDIUM", "LOW"
+  timestamp          DateTime         @default(now())
+}
