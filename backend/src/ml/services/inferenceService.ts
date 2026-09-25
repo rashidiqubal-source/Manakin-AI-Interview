@@ -58,11 +58,11 @@ export class InferenceService {
         return candidate;
       }
     }
-    return candidates[0];
+    return null;
   }
 
   private findPythonCmd(): string {
-    if (process.env.PYTHON_PATH) {
+    if (process.env.PYTHON_PATH && fs.existsSync(process.env.PYTHON_PATH)) {
       return process.env.PYTHON_PATH;
     }
     const isWin = process.platform === 'win32';
@@ -70,10 +70,14 @@ export class InferenceService {
       path.resolve(process.cwd(), isWin ? 'ml_service/venv/Scripts/python.exe' : 'ml_service/venv/bin/python'),
       path.resolve(process.cwd(), isWin ? '.venv/Scripts/python.exe' : '.venv/bin/python'),
       path.resolve(process.cwd(), isWin ? 'backend/ml_service/venv/Scripts/python.exe' : 'backend/ml_service/venv/bin/python'),
+      path.resolve(process.cwd(), isWin ? 'backend/.venv/Scripts/python.exe' : 'backend/.venv/bin/python'),
       path.resolve(__dirname, isWin ? '../../../ml_service/venv/Scripts/python.exe' : '../../../ml_service/venv/bin/python'),
+      path.resolve(__dirname, isWin ? '../../ml_service/venv/Scripts/python.exe' : '../../ml_service/venv/bin/python'),
+      path.resolve(__dirname, isWin ? '../ml_service/venv/Scripts/python.exe' : '../ml_service/venv/bin/python'),
     ];
     for (const venvPython of venvCandidates) {
       if (fs.existsSync(venvPython)) {
+        logger.info(`[YOLO26] Using Python binary from virtual environment: ${venvPython}`);
         return venvPython;
       }
     }
@@ -101,49 +105,61 @@ export class InferenceService {
 
       // 2. Auto-spawn Python YOLO26 microservice
       const serverScript = this.findServerScript();
+      if (!serverScript) {
+        logger.warn('[YOLO26] Python server script (server.py) not found. Skipping local microservice launch.');
+        this.isInitializing = false;
+        return;
+      }
       logger.info(`[YOLO26] Launching Python YOLO26 server: ${serverScript}`);
 
       const pythonCmd = this.findPythonCmd();
 
-      this.pythonProcess = spawn(pythonCmd, [serverScript || 'ml_service/server.py'], {
-        cwd: process.cwd(),
-        env: {
-          ...process.env,
-          PYTHONUNBUFFERED: '1',
-          YOLO26_PORT: '5001',
-          YOLO26_HOST: '127.0.0.1',
-        },
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
+      try {
+        this.pythonProcess = spawn(pythonCmd, [serverScript], {
+          cwd: path.dirname(serverScript),
+          env: {
+            ...process.env,
+            PYTHONUNBUFFERED: '1',
+            YOLO26_PORT: '5001',
+            YOLO26_HOST: '127.0.0.1',
+          },
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
 
-      this.pythonProcess.stdout?.on('data', (data) => {
-        logger.info(`[YOLO26 Python] ${data.toString().trim()}`);
-      });
+        this.pythonProcess.stdout?.on('data', (data) => {
+          logger.info(`[YOLO26 Python] ${data.toString().trim()}`);
+        });
 
-      this.pythonProcess.stderr?.on('data', (data) => {
-        const msg = data.toString().trim();
-        if (msg.toLowerCase().includes('error')) {
-          logger.error(`[YOLO26 Python Error] ${msg}`);
-        } else {
-          logger.debug(`[YOLO26 Python] ${msg}`);
-        }
-      });
+        this.pythonProcess.stderr?.on('data', (data) => {
+          const msg = data.toString().trim();
+          if (msg.toLowerCase().includes('error')) {
+            logger.error(`[YOLO26 Python Error] ${msg}`);
+          } else {
+            logger.debug(`[YOLO26 Python] ${msg}`);
+          }
+        });
 
-      this.pythonProcess.on('error', (err) => {
-        logger.warn(`[YOLO26] Failed to spawn Python process (${pythonCmd}): ${err.message}. Ensure python3 is installed or set PYTHON_PATH.`);
-        this.faceDetector.setLoaded(false);
-        this.objectDetector.setLoaded(false);
-        this.isInitialized = false;
+        this.pythonProcess.on('error', (err) => {
+          logger.warn(`[YOLO26] Failed to spawn Python process (${pythonCmd}): ${err.message}. ML features will operate in fallback mode.`);
+          this.faceDetector.setLoaded(false);
+          this.objectDetector.setLoaded(false);
+          this.isInitialized = false;
+          this.pythonProcess = null;
+        });
+
+        this.pythonProcess.on('exit', (code, signal) => {
+          logger.warn(`[YOLO26] Python server process exited (code: ${code}, signal: ${signal})`);
+          this.faceDetector.setLoaded(false);
+          this.objectDetector.setLoaded(false);
+          this.isInitialized = false;
+          this.pythonProcess = null;
+        });
+      } catch (spawnErr: any) {
+        logger.warn(`[YOLO26] Synchronous error spawning python (${pythonCmd}): ${spawnErr.message}`);
         this.pythonProcess = null;
-      });
-
-      this.pythonProcess.on('exit', (code, signal) => {
-        logger.warn(`[YOLO26] Python server process exited (code: ${code}, signal: ${signal})`);
-        this.faceDetector.setLoaded(false);
-        this.objectDetector.setLoaded(false);
-        this.isInitialized = false;
-        this.pythonProcess = null;
-      });
+        this.isInitializing = false;
+        return;
+      }
 
       // Cleanup hook
       const cleanUp = () => {
@@ -161,11 +177,14 @@ export class InferenceService {
       process.on('SIGINT', cleanUp);
       process.on('SIGTERM', cleanUp);
 
-      // Poll until ready — 150 retries × 1s = up to 150s
-      // Cold Render boot needs ~90s to download HF face model + warm up YOLO
-      const maxRetries = 150;
+      // Poll until ready (up to 60 retries * 500ms = 30 seconds)
+      const maxRetries = 60;
       for (let i = 0; i < maxRetries; i++) {
-        await new Promise((r) => setTimeout(r, 1000));
+        if (!this.pythonProcess) {
+          logger.warn('[YOLO26] Python process stopped or failed. Aborting startup wait.');
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 500));
         const ready = await this.checkServiceHealth();
         if (ready) {
           this.faceDetector.setLoaded(true);
