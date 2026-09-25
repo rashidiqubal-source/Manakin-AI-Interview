@@ -7,23 +7,18 @@ export function middleware(request: NextRequest) {
   const { pathname } = request.nextUrl;
   const sessionCookie = request.cookies.get(SESSION_COOKIE_NAME);
 
-  // Check if route is protected
+  // Direct candidate sign-in/dashboard is disabled (candidates can only join via recruiter invitation)
+  if (pathname.startsWith('/applicant')) {
+    return NextResponse.redirect(new URL('/', request.url));
+  }
+
+  // Recruiter route protection
   const isRecruiterProtected = pathname.startsWith('/recruiter') && 
     !pathname.startsWith('/recruiter/sign-in') && 
     !pathname.startsWith('/recruiter/sign-up');
 
-  const isApplicantProtected = pathname.startsWith('/applicant/dashboard');
-
-  const isInterviewProtected = pathname.startsWith('/interview');
-
   if (isRecruiterProtected && !sessionCookie) {
     const loginUrl = new URL('/recruiter/sign-in', request.url);
-    loginUrl.searchParams.set('redirect', pathname);
-    return NextResponse.redirect(loginUrl);
-  }
-
-  if ((isApplicantProtected || isInterviewProtected) && !sessionCookie) {
-    const loginUrl = new URL('/applicant/sign-in', request.url);
     loginUrl.searchParams.set('redirect', pathname);
     return NextResponse.redirect(loginUrl);
   }
@@ -34,8 +29,7 @@ export function middleware(request: NextRequest) {
 export const config = {
   matcher: [
     '/recruiter/:path*',
-    '/applicant/dashboard/:path*',
-    '/interview/:path*',
+    '/applicant/:path*',
     '/dashboard/:path*',
   ],
 };

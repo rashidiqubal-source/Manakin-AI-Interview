@@ -45,14 +45,15 @@ export class EmailService {
     }
   }
 
-  static async sendDecisionEmail(to: string, status: 'ACCEPTED' | 'REJECTED', name: string) {
+  static async sendDecisionEmail(to: string, status: 'ACCEPTED' | 'REJECTED', name: string, jobTitle?: string) {
     const transporter = await this.getTransporter();
     
     let subject = '';
     let htmlContent = '';
+    const displayRole = jobTitle ? `<strong>${jobTitle}</strong>` : 'the open position';
 
     if (status === 'ACCEPTED') {
-      subject = '🎉 AI Interview Update: Selected for Next Round!';
+      subject = `🎉 AI Interview Update: Selected for Next Round - ${jobTitle || 'Interview Platform'}`;
       htmlContent = `
         <div style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; max-width: 600px; margin: 0 auto; padding: 24px; border: 1px solid #e5e7eb; border-radius: 12px; background-color: #ffffff;">
           <div style="text-align: center; margin-bottom: 24px; padding-bottom: 16px; border-bottom: 2px solid #0d9488;">
@@ -60,11 +61,11 @@ export class EmailService {
             <h2 style="color: #0f766e; margin-top: 12px; font-size: 22px;">Congratulations, ${name}!</h2>
           </div>
           <div style="line-height: 1.7; color: #374151; font-size: 15px;">
-            <p>We are excited to let you know that you passed your automated AI voice screening interview for the <strong>Tutor Role</strong>.</p>
-            <p>Our AI evaluation engine assessed your communication clarity, pedagogical approach, patience, and fluency, and your results were outstanding!</p>
+            <p>We are excited to let you know that you passed your automated AI voice screening interview for ${displayRole}.</p>
+            <p>Our AI evaluation engine assessed your technical competencies, problem-solving approach, communication clarity, and understanding, and your results were strong!</p>
             <div style="background-color: #f0fdf4; border-left: 4px solid #16a34a; padding: 14px; margin: 20px 0; border-radius: 6px;">
               <strong style="color: #15803d;">Next Steps:</strong>
-              <p style="margin: 4px 0 0 0; color: #166534;">Our hiring team is reviewing your assessment analytics. We will follow up shortly to schedule your final round.</p>
+              <p style="margin: 4px 0 0 0; color: #166534;">Our hiring team is reviewing your assessment dossier. We will follow up shortly with details regarding the next steps.</p>
             </div>
             <p>Thank you for taking the time to interview on our platform.</p>
           </div>
@@ -75,7 +76,7 @@ export class EmailService {
         </div>
       `;
     } else {
-      subject = 'AI Interview Update: Application Status';
+      subject = `AI Interview Update: Application Status - ${jobTitle || 'Interview Platform'}`;
       htmlContent = `
         <div style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; max-width: 600px; margin: 0 auto; padding: 24px; border: 1px solid #e5e7eb; border-radius: 12px; background-color: #ffffff;">
           <div style="text-align: center; margin-bottom: 24px; padding-bottom: 16px; border-bottom: 2px solid #6b7280;">
@@ -83,8 +84,8 @@ export class EmailService {
             <h2 style="color: #1f2937; margin-top: 12px; font-size: 22px;">Dear ${name},</h2>
           </div>
           <div style="line-height: 1.7; color: #374151; font-size: 15px;">
-            <p>Thank you for completing the voice screening interview on our <strong>AI Interview Platform</strong>.</p>
-            <p>Our evaluation team has thoroughly reviewed your interview assessment. While we appreciate your time and effort, we will not be moving forward with your candidacy for this specific role at this time.</p>
+            <p>Thank you for completing the technical screening interview on our <strong>AI Interview Platform</strong> for ${displayRole}.</p>
+            <p>Our evaluation team has reviewed your interview assessment. While we appreciate your time and effort, we will not be moving forward with your candidacy for this specific opening at this time.</p>
             <p>We encourage you to apply for future opportunities as new positions open up.</p>
           </div>
           <div style="margin-top: 32px; padding-top: 16px; border-top: 1px solid #f3f4f6; text-align: center; color: #6b7280; font-size: 13px;">
@@ -103,7 +104,7 @@ export class EmailService {
         html: htmlContent,
       });
 
-      logger.info(`Decision email sent to ${to}. Status: ${status}`);
+      logger.info(`Decision email sent to ${to}. Status: ${status}. MessageId: ${info.messageId}. Response: ${info.response}`);
       if (!env.MAILERO_USERNAME || !(env.MAILERO_PASSWORD || env.MAILERO_SENDING_KEY)) {
         logger.info(`Preview Mock Email URL: ${nodemailer.getTestMessageUrl(info)}`);
       }
@@ -129,7 +130,7 @@ export class EmailService {
             <p style="margin: 0 0 12px 0; color: #0f766e; font-weight: 600;">Your Unique Interview Link:</p>
             <a href="${interviewLink}" style="display: inline-block; background-color: #0d9488; color: #ffffff; padding: 12px 28px; text-decoration: none; border-radius: 8px; font-weight: 700; font-size: 15px; shadow: 0 4px 6px rgba(0,0,0,0.1);">
               Start AI Interview &rarr;
-            </a>
+            </a> 
           </div>
           <p style="font-size: 13px; color: #6b7280; text-align: center;">
             Or copy and paste this URL into your browser:<br />
@@ -152,12 +153,60 @@ export class EmailService {
         html: htmlContent,
       });
 
-      logger.info(`Invitation email sent to ${to} for job "${jobTitle}". Token: ${inviteToken}`);
+      logger.info(`Invitation email sent to ${to} for job "${jobTitle}". Token: ${inviteToken}. MessageId: ${info.messageId}. Response: ${info.response}`);
       if (!env.MAILERO_USERNAME || !(env.MAILERO_PASSWORD || env.MAILERO_SENDING_KEY)) {
         logger.info(`Preview Mock Email URL: ${nodemailer.getTestMessageUrl(info)}`);
       }
     } catch (err) {
       logger.error(`Failed to send invitation email to ${to}:`, err);
+    }
+  }
+
+  static async sendTestCompletedEmail(to: string, name?: string, jobTitle?: string) {
+    const transporter = await this.getTransporter();
+    const recipientName = name || 'Candidate';
+    const displayRole = jobTitle ? `for <strong>${jobTitle}</strong>` : '';
+
+    const subject = `✅ Assessment Completed: Your AI Technical Interview Has Been Received`;
+    const htmlContent = `
+      <div style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; max-width: 600px; margin: 0 auto; padding: 24px; border: 1px solid #e5e7eb; border-radius: 12px; background-color: #ffffff;">
+        <div style="text-align: center; margin-bottom: 24px; padding-bottom: 16px; border-bottom: 2px solid #0d9488;">
+          <span style="background-color: #ccfbf1; color: #0f766e; padding: 6px 14px; border-radius: 20px; font-weight: 600; font-size: 14px;">🤖 AI Interview Platform</span>
+          <h2 style="color: #111827; margin-top: 12px; font-size: 22px;">Assessment Successfully Received</h2>
+        </div>
+        <div style="line-height: 1.7; color: #374151; font-size: 15px;">
+          <p>Hello ${recipientName},</p>
+          <p>Thank you for taking the time to complete your technical interview ${displayRole}. Your assessment responses, code solutions, and proctoring verification have been securely submitted to the hiring team.</p>
+          <div style="background-color: #f0fdf4; border-left: 4px solid #16a34a; padding: 14px 18px; margin: 24px 0; border-radius: 6px;">
+            <p style="margin: 0; font-weight: 600; color: #166534;">
+              Status: Assessment Complete & Under Review
+            </p>
+            <p style="margin: 6px 0 0 0; font-size: 13px; color: #15803d;">
+              Our recruitment team will review your comprehensive evaluation and reach out to you directly regarding the next steps in the hiring process.
+            </p>
+          </div>
+          <p style="font-size: 13px; color: #6b7280;">
+            Note: Detailed AI evaluation reports and telemetry are confidential to the recruiter's hiring team. If you have any questions, please reach out to your recruiter directly.
+          </p>
+        </div>
+        <div style="margin-top: 32px; padding-top: 16px; border-top: 1px solid #f3f4f6; text-align: center; color: #6b7280; font-size: 13px;">
+          <p style="margin: 0;">Best regards,</p>
+          <p style="margin: 4px 0 0 0; font-weight: 600; color: #111827;">The AI Recruitment Platform Team</p>
+        </div>
+      </div>
+    `;
+
+    try {
+      const info = await transporter.sendMail({
+        from: env.MAILERO_FROM,
+        to,
+        subject,
+        html: htmlContent,
+      });
+
+      logger.info(`Test completion email sent to ${to}. MessageId: ${info.messageId}`);
+    } catch (err: any) {
+      logger.error(`Failed to send test completion email to ${to}: ${err.message}`);
     }
   }
 
@@ -201,7 +250,7 @@ export class EmailService {
         html: htmlContent,
       });
 
-      logger.info(`Verification email sent to ${to}`);
+      logger.info(`Verification email sent to ${to}. MessageId: ${info.messageId}. Response: ${info.response}`);
       if (!env.MAILERO_USERNAME || !(env.MAILERO_PASSWORD || env.MAILERO_SENDING_KEY)) {
         logger.info(`Preview Mock Email URL: ${nodemailer.getTestMessageUrl(info)}`);
       }
@@ -255,7 +304,7 @@ export class EmailService {
         html: htmlContent,
       });
 
-      logger.info(`Password reset email sent to ${to}`);
+      logger.info(`Password reset email sent to ${to}. MessageId: ${info.messageId}. Response: ${info.response}`);
       if (!env.MAILERO_USERNAME || !(env.MAILERO_PASSWORD || env.MAILERO_SENDING_KEY)) {
         logger.info(`Preview Mock Email URL: ${nodemailer.getTestMessageUrl(info)}`);
       }

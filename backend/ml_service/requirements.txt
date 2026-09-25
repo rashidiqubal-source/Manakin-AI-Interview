@@ -1,7 +1,17 @@
-ultralytics>=8.4.0
+# CPU-only torch for Linux/Docker; native wheels for macOS/Windows
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.2.2+cpu; sys_platform == 'linux'
+torchvision==0.17.2+cpu; sys_platform == 'linux'
+torch>=2.2.0; sys_platform == 'darwin'
+torchvision>=0.17.0; sys_platform == 'darwin'
+torch>=2.2.0; sys_platform == 'win32'
+torchvision>=0.17.0; sys_platform == 'win32'
+
+# ultralytics >=8.3.0 introduced YOLO11 architecture (C3k2 block)
+ultralytics>=8.3.0
 fastapi>=0.115.0
 uvicorn>=0.34.0
 pillow>=10.4.0
-numpy>=1.23.0
-opencv-python-headless>=4.7.0
-huggingface_hub>=0.25.0
+numpy>=1.26.4
+opencv-python-headless>=4.10.0.84
+huggingface_hub>=0.25.2

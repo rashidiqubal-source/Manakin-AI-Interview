@@ -6,19 +6,22 @@ import { motion, AnimatePresence } from "framer-motion";
 import { Mic, Square, Loader2, ArrowRight } from "lucide-react";
 import { useInterviewStore } from "@/lib/store";
 import { useAudioRecorder } from "@/hooks/useAudioRecorder";
-import { transcribeAudioAPI, respondInterviewAPI, evaluateInterviewAPI, submitFeedbackAPI, updateApplicationStatusAPI, startInterviewAPI, sendProctoringFrameAPI, detectMLFrameAPI } from "@/services/api";
+import { transcribeAudioAPI, respondInterviewAPI, evaluateInterviewAPI, concludeEarlyAPI, submitFeedbackAPI, updateApplicationStatusAPI, startInterviewAPI, sendProctoringFrameAPI, detectMLFrameAPI } from "@/services/api";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
-import { Copy, Check, MessageSquareHeart, Camera, CameraOff, ScanFace } from "lucide-react";
+import { Copy, Check, MessageSquareHeart, Camera, CameraOff, ScanFace, Volume2, VolumeX, Eye, Timer, RefreshCw, Code2, Terminal, CheckCircle2, RotateCcw, ShieldCheck, AlertCircle, Maximize2, Minimize2, ShieldAlert, Keyboard, Radio, Sparkles } from "lucide-react";
 import { useAuthStore } from "@/lib/authStore";
 
 import { detectFacesInVideo } from "@/lib/faceDetector";
+import { eyeTracker, GazePoint } from "@/lib/eyeTracker";
+import { proctoringEngine } from "@/lib/proctoringEngine";
+import { useKokoroTTS } from "@/hooks/useKokoroTTS";
 
 import { io, Socket } from "socket.io-client";
 
 // Temporal State Machine Configurations
 const FACE_CONFIRM_FRAMES = 2;
-const FACE_LOST_FRAMES = 3;
+const FACE_LOST_FRAMES = 1;
 const OBJECT_CONFIRM_FRAMES = 2;
 const OBJECT_CLEAR_FRAMES = 4;
 
@@ -26,7 +29,7 @@ export default function InterviewPage() {
   const router = useRouter();
   const { user } = useAuthStore();
 
-  const { sessionId, setSessionId, messages, addMessage, setEvaluation } = useInterviewStore();
+  const { sessionId, setSessionId, messages, addMessage, setEvaluation, isDemo } = useInterviewStore();
   const { isRecording, startRecording, stopRecording } = useAudioRecorder();
   
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -40,7 +43,28 @@ export default function InterviewPage() {
   
   useEffect(() => {
     sessionIdRef.current = sessionId;
-  }, [sessionId]);
+    if (sessionId && socketRef.current) {
+      proctoringEngine.start({
+        socket: socketRef.current,
+        sessionId,
+        getCurrentTurn: () => messages.filter((m) => m.role === 'assistant').length,
+      });
+    }
+  }, [sessionId, messages.length]);
+
+  // Enforce Invitation Requirement: Candidates can only join via recruiter invitation
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      const activeSession = sessionId || sessionIdRef.current;
+      if (!activeSession) {
+        toast.error("Invitation Required", {
+          description: "Candidates can only access interviews through a valid recruiter invitation link.",
+        });
+        router.push("/");
+      }
+    }, 1200);
+    return () => clearTimeout(timer);
+  }, [sessionId, router]);
   const engagementStats = useRef({ totalFrames: 0, faceDetectedFrames: 0 });
   const [violationCount, setViolationCount] = useState(0);
   const violationCountRef = useRef(0);
@@ -52,9 +76,10 @@ export default function InterviewPage() {
   const [faceConfidence, setFaceConfidence] = useState(0);
   const [detectedFaceCount, setDetectedFaceCount] = useState(0);
 
-  // --- ABSENCE TIMER (STRICT 3.0s RULE) ---
+  // --- ABSENCE TIMER (STRICT 1.0s RULE) ---
   const absenceTimerRef = useRef(0);
   const [absenceTimerDisplay, setAbsenceTimerDisplay] = useState(0);
+  const absenceStartTimeRef = useRef<number | null>(null);
   const lastAbsenceTick = useRef(Date.now());
 
   // --- LOW CONFIDENCE FACE FLAGGING (<35%) ---
@@ -117,10 +142,77 @@ export default function InterviewPage() {
   
   const [isProcessing, setIsProcessing] = useState(false);
   const [isEvaluating, setIsEvaluating] = useState(false);
+  const [isConcludingEarly, setIsConcludingEarly] = useState(false);
+  const [showConcludeEarlyModal, setShowConcludeEarlyModal] = useState(false);
   const [showFeedbackModal, setShowFeedbackModal] = useState(false);
+  const [isInterviewCompleted, setIsInterviewCompleted] = useState(false);
   const [feedbackText, setFeedbackText] = useState("");
   const [isSubmittingFeedback, setIsSubmittingFeedback] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  // --- LIVE INTERACTIVE CODING CHALLENGE ---
+  interface CodeChallenge {
+    id: string;
+    repoName: string;
+    functionName: string;
+    language: string;
+    title: string;
+    description: string;
+    starterCode: string;
+    expectedBehavior: string;
+  }
+  const [activeCodeChallenge, setActiveCodeChallenge] = useState<CodeChallenge | null>(null);
+  const [codeSolution, setCodeSolution] = useState<string>("");
+  const [isSubmittingCode, setIsSubmittingCode] = useState(false);
+
+  // --- KOKORO TTS & POST-TTS SILENCE STOPWATCH ---
+  const kokoroTTS = useKokoroTTS();
+  const [thinkingTime, setThinkingTime] = useState<number>(0);
+  const [isWaitingForResponse, setIsWaitingForResponse] = useState<boolean>(false);
+  const silenceStartRef = useRef<number | null>(null);
+  const recordedSilenceSecRef = useRef<number>(0);
+  const [currentGaze, setCurrentGaze] = useState<GazePoint | null>(null);
+  const [perQuestionLatencies, setPerQuestionLatencies] = useState<Array<{
+    turn: number;
+    question: string;
+    silenceDurationSec: number;
+    ttsDurationSec: number;
+  }>>([]);
+
+  const startSilenceStopwatch = () => {
+    silenceStartRef.current = performance.now();
+    setIsWaitingForResponse(true);
+    setThinkingTime(0);
+    if (streamRef.current) {
+      proctoringEngine.startSilenceAudioMonitoring(streamRef.current);
+    }
+  };
+
+  const stopSilenceStopwatch = () => {
+    if (silenceStartRef.current !== null) {
+      const elapsed = (performance.now() - silenceStartRef.current) / 1000;
+      recordedSilenceSecRef.current = Math.max(0, Math.round(elapsed * 10) / 10);
+      silenceStartRef.current = null;
+    }
+    setIsWaitingForResponse(false);
+    proctoringEngine.stopSilenceAudioMonitoring();
+  };
+
+  useEffect(() => {
+    if (!isWaitingForResponse) return;
+    const interval = setInterval(() => {
+      if (silenceStartRef.current !== null) {
+        const elapsed = (performance.now() - silenceStartRef.current) / 1000;
+        setThinkingTime(Math.round(elapsed * 10) / 10);
+      }
+    }, 100);
+    return () => clearInterval(interval);
+  }, [isWaitingForResponse]);
+
+  // Initialize MediaPipe eye tracker on mount
+  useEffect(() => {
+    eyeTracker.initialize().catch((err) => console.warn("EyeTracker init error:", err));
+  }, []);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -129,19 +221,125 @@ export default function InterviewPage() {
   const [isSetupComplete, setIsSetupComplete] = useState(false);
   const isSetupCompleteRef = useRef(false);
   const [isStartingInterview, setIsStartingInterview] = useState(false);
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const [hasClosedOtherTabs, setHasClosedOtherTabs] = useState(false);
+
+  // --- 30-MINUTE INTERVIEW COUNTDOWN TIMER ---
+  const TOTAL_INTERVIEW_DURATION_SEC = 30 * 60;
+  const [secondsRemaining, setSecondsRemaining] = useState<number>(TOTAL_INTERVIEW_DURATION_SEC);
+  const [isTimeExpired, setIsTimeExpired] = useState<boolean>(false);
+
+  useEffect(() => {
+    if (!isSetupComplete || isInterviewCompleted || isEvaluating) return;
+
+    const interval = setInterval(() => {
+      setSecondsRemaining((prev) => {
+        if (prev <= 1) {
+          clearInterval(interval);
+          setIsTimeExpired(true);
+          toast.info("30-Minute Interview Concluded", {
+            description: "Your session duration has reached 30 minutes. Compiling comprehensive evaluation...",
+          });
+          handleFinish();
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+
+    return () => clearInterval(interval);
+  }, [isSetupComplete, isInterviewCompleted, isEvaluating]);
+
+  const formatTimeRemaining = (totalSec: number) => {
+    const mins = Math.floor(totalSec / 60);
+    const secs = totalSec % 60;
+    return `${mins}:${secs < 10 ? '0' : ''}${secs}`;
+  };
 
   useEffect(() => {
     isSetupCompleteRef.current = isSetupComplete;
   }, [isSetupComplete]);
 
+  const spokenMessageIdsRef = useRef<Set<string>>(new Set());
+
+  // Only auto-resume if the candidate has ALREADY started answering previous questions
   useEffect(() => {
-    if (sessionId && messages.length > 0) {
+    if (sessionId && messages.some((m) => m.role === "user")) {
       setIsSetupComplete(true);
     }
   }, [sessionId, messages]);
 
-  const triggerViolation = (type: string, message: string, points: number = 1) => {
+  // Automatically trigger Kokoro TTS speech for any new assistant question
+  useEffect(() => {
+    if (!isSetupComplete) return;
+    const assistantMessages = messages.filter((m) => m.role === "assistant");
+    const latestAssistantMsg = assistantMessages[assistantMessages.length - 1];
+    if (latestAssistantMsg && !spokenMessageIdsRef.current.has(latestAssistantMsg.id)) {
+      spokenMessageIdsRef.current.add(latestAssistantMsg.id);
+      kokoroTTS.speakQuestion(latestAssistantMsg.content, () => {
+        startSilenceStopwatch();
+      });
+    }
+  }, [messages, isSetupComplete, kokoroTTS]);
+
+  // --- VIOLATION SNAPSHOT EVIDENCE & LIVE TESTING INSPECTOR STATES ---
+  const [latestViolationSnapshot, setLatestViolationSnapshot] = useState<{
+    image: string;
+    type: string;
+    message: string;
+    timestamp: string;
+  } | null>(null);
+
+  const [isInspectorOpen, setIsInspectorOpen] = useState(true);
+  const [isInspectorMinimized, setIsInspectorMinimized] = useState(false);
+  const [liveGazeStatus, setLiveGazeStatus] = useState({
+    direction: 'CENTER',
+    gazeX: 0.5,
+    gazeY: 0.5,
+    isAway: false,
+    downwardDwellSec: 0,
+    readingSaccades: 0,
+    recentGlancesCount: 0,
+  });
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setLiveGazeStatus(eyeTracker.getLiveStatus());
+    }, 200);
+    return () => clearInterval(timer);
+  }, []);
+
+  // Capture lightweight webcam snapshot (320x240 JPEG)
+  const captureViolationSnapshot = (): string | null => {
+    try {
+      const video = videoRef.current;
+      if (!video || video.readyState < 2 || video.videoWidth === 0) return null;
+      const canvas = document.createElement("canvas");
+      canvas.width = 320;
+      canvas.height = 240;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return null;
+      ctx.drawImage(video, 0, 0, 320, 240);
+      return canvas.toDataURL("image/jpeg", 0.6);
+    } catch (err) {
+      console.warn("Failed to capture violation snapshot:", err);
+      return null;
+    }
+  };
+
+  const triggerViolation = (type: string, message: string, points: number = 1, metadata?: any) => {
     cheatFlags.current.push(type);
+
+    // Capture visual photographic evidence from live camera feed
+    const snapshotBase64 = captureViolationSnapshot();
+    if (snapshotBase64) {
+      setLatestViolationSnapshot({
+        image: snapshotBase64,
+        type,
+        message,
+        timestamp: new Date().toLocaleTimeString(),
+      });
+    }
 
     // Always increment locally by points (+2 for phone, +1 for face absence) for instant UI feedback
     violationCountRef.current += points;
@@ -155,15 +353,239 @@ export default function InterviewPage() {
         sessionId: activeSessionId,
         type,
         message,
-        points
+        points,
+        snapshotBase64,
+        metadata,
       });
     }
-    
-    toast.error(`⚠ MISCONDUCT DETECTED (+${points} pts)`, {
-      description: message,
-      duration: 6000,
-    });
+    // Proctoring telemetry is sent silently to socket and DB
   };
+
+  // --- KEYSTROKE & PASTE VELOCITY TELEMETRY ---
+  const [keystrokeMetrics, setKeystrokeMetrics] = useState({
+    cpm: 0,
+    pasteBursts: 0,
+    cadence: 'NATURAL' as 'NATURAL' | 'BURST' | 'SYNTHETIC_MACRO',
+    lastBurstChars: 0,
+  });
+  const keystrokeTimestampsRef = useRef<number[]>([]);
+  const pasteBurstsCounterRef = useRef<number>(0);
+
+  const handleCodePaste = (pastedText: string) => {
+    const charCount = pastedText.length;
+    const lineCount = pastedText.split('\n').length;
+
+    // Detect burst injection: >40 chars or >=3 lines instantaneous paste
+    if (charCount > 40 || lineCount >= 3) {
+      pasteBurstsCounterRef.current += 1;
+      setKeystrokeMetrics((prev) => ({
+        ...prev,
+        pasteBursts: pasteBurstsCounterRef.current,
+        cadence: 'BURST',
+        lastBurstChars: charCount,
+      }));
+
+      triggerViolation(
+        'CODE_PASTE_BURST',
+        `Instantaneous code injection detected: ${charCount} chars (${lineCount} lines) pasted into editor.`,
+        2,
+        {
+          charCount,
+          lineCount,
+          snippetPreview: pastedText.slice(0, 80),
+          injectedAt: new Date().toISOString(),
+        }
+      );
+    }
+  };
+
+  const recordKeystroke = () => {
+    const now = performance.now();
+    const timestamps = keystrokeTimestampsRef.current;
+    timestamps.push(now);
+
+    if (timestamps.length > 25) {
+      timestamps.shift();
+    }
+
+    if (timestamps.length >= 6) {
+      let totalIki = 0;
+      for (let i = 1; i < timestamps.length; i++) {
+        totalIki += (timestamps[i] - timestamps[i - 1]);
+      }
+      const avgIki = totalIki / (timestamps.length - 1);
+      const elapsedMin = totalIki / 60000;
+      const cpm = elapsedMin > 0 ? Math.round(timestamps.length / elapsedMin) : 0;
+
+      let cadence: 'NATURAL' | 'BURST' | 'SYNTHETIC_MACRO' = 'NATURAL';
+      if (avgIki < 12 && timestamps.length >= 15) {
+        cadence = 'SYNTHETIC_MACRO';
+        triggerViolation(
+          'UNNATURAL_KEYSTROKE_CADENCE',
+          `Unnatural typing cadence detected: average interval ${avgIki.toFixed(1)}ms (<12ms threshold). Macro injection suspected.`,
+          1,
+          {
+            avgIkiMs: Math.round(avgIki * 10) / 10,
+            sampleSize: timestamps.length,
+          }
+        );
+      }
+
+      setKeystrokeMetrics((prev) => ({
+        ...prev,
+        cpm: Math.min(2000, cpm),
+        cadence,
+      }));
+    }
+  };
+
+  // --- NATURAL INTERRUPTION (BARGE-IN) AUDIO LISTENER ---
+  const [isBargeInActive, setIsBargeInActive] = useState(false);
+  const bargeInThresholdStartRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    if (!kokoroTTS.isPlaying || !streamRef.current) {
+      bargeInThresholdStartRef.current = null;
+      return;
+    }
+
+    let audioCtx: AudioContext | null = null;
+    let analyser: AnalyserNode | null = null;
+    let source: MediaStreamAudioSourceNode | null = null;
+    let animId: number | null = null;
+
+    try {
+      const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+      audioCtx = new AudioContextClass();
+      analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 512;
+      source = audioCtx.createMediaStreamSource(streamRef.current);
+      source.connect(analyser);
+
+      const bufferLength = analyser.fftSize;
+      const dataArray = new Float32Array(bufferLength);
+
+      const checkVolume = () => {
+        if (!kokoroTTS.isPlaying) return;
+        analyser!.getFloatTimeDomainData(dataArray);
+
+        let sumSquares = 0;
+        for (let i = 0; i < bufferLength; i++) {
+          sumSquares += dataArray[i] * dataArray[i];
+        }
+        const rms = Math.sqrt(sumSquares / bufferLength);
+
+        // Voice energy threshold: RMS > 0.05 sustained for > 150ms
+        if (rms > 0.05) {
+          if (bargeInThresholdStartRef.current === null) {
+            bargeInThresholdStartRef.current = performance.now();
+          } else if (performance.now() - bargeInThresholdStartRef.current > 150) {
+            console.log("🗣️ [BARGE-IN] Candidate interrupted AI playback (RMS:", rms.toFixed(3), ")");
+            kokoroTTS.stopAudio();
+            setIsBargeInActive(true);
+            setTimeout(() => setIsBargeInActive(false), 3000);
+
+            const activeSessionId = sessionId || sessionIdRef.current;
+            if (socketRef.current && activeSessionId) {
+              socketRef.current.emit('barge_in', {
+                sessionId: activeSessionId,
+                timestamp: Date.now(),
+              });
+            }
+            startSilenceStopwatch();
+            return;
+          }
+        } else {
+          bargeInThresholdStartRef.current = null;
+        }
+
+        animId = requestAnimationFrame(checkVolume);
+      };
+
+      animId = requestAnimationFrame(checkVolume);
+    } catch (err) {
+      console.warn("Barge-in audio monitor error:", err);
+    }
+
+    return () => {
+      if (animId) cancelAnimationFrame(animId);
+      if (source) source.disconnect();
+      if (audioCtx && audioCtx.state !== 'closed') audioCtx.close();
+    };
+  }, [kokoroTTS.isPlaying]);
+
+  // Fullscreen Mode Activation & Proctoring Enforcement
+  const requestFullscreenMode = async () => {
+    try {
+      const elem = document.documentElement as any;
+      if (elem.requestFullscreen) {
+        await elem.requestFullscreen();
+      } else if (elem.webkitRequestFullscreen) {
+        await elem.webkitRequestFullscreen();
+      } else if (elem.mozRequestFullScreen) {
+        await elem.mozRequestFullScreen();
+      } else if (elem.msRequestFullscreen) {
+        await elem.msRequestFullscreen();
+      }
+      setIsFullscreen(true);
+      toast.success("Fullscreen Mode Activated", {
+        description: "Browser tabs and toolbars hidden for exam integrity.",
+      });
+    } catch (err: any) {
+      console.warn("Fullscreen request error:", err);
+      toast.error("Fullscreen Request Blocked", {
+        description: "Please allow fullscreen mode in your browser to proceed.",
+      });
+    }
+  };
+
+  useEffect(() => {
+    const updateFsState = () => {
+      const isFs = !!(
+        document.fullscreenElement ||
+        (document as any).webkitFullscreenElement ||
+        (document as any).mozFullScreenElement ||
+        (document as any).msFullscreenElement
+      );
+      setIsFullscreen(isFs);
+
+      // If exited during an active interview session, log proctoring violation and snapshot
+      if (isSetupCompleteRef.current && !isInterviewCompleted && !isFs) {
+        triggerViolation(
+          "FULLSCREEN_EXIT",
+          "Candidate exited fullscreen mode or switched windows/tabs",
+          1,
+          { action: "FULLSCREEN_EXITED", recordedAt: new Date().toISOString() }
+        );
+      }
+    };
+
+    const handleVisibilityChange = () => {
+      if (document.hidden && isSetupCompleteRef.current && !isInterviewCompleted) {
+        triggerViolation(
+          "TAB_HIDDEN",
+          "Candidate navigated away from the active interview tab",
+          1,
+          { action: "TAB_HIDDEN", recordedAt: new Date().toISOString() }
+        );
+      }
+    };
+
+    updateFsState();
+    document.addEventListener("fullscreenchange", updateFsState);
+    document.addEventListener("webkitfullscreenchange", updateFsState);
+    document.addEventListener("mozfullscreenchange", updateFsState);
+    document.addEventListener("MSFullscreenChange", updateFsState);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+
+    return () => {
+      document.removeEventListener("fullscreenchange", updateFsState);
+      document.removeEventListener("webkitfullscreenchange", updateFsState);
+      document.removeEventListener("mozfullscreenchange", updateFsState);
+      document.removeEventListener("MSFullscreenChange", updateFsState);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, [isInterviewCompleted]);
 
   // Instant Video Stream Attacher (never lets the video drop on unmount/re-render)
   const attachVideoRef = (node: HTMLVideoElement | null) => {
@@ -399,6 +821,7 @@ export default function InterviewPage() {
       if (consecutivePositiveFaces.current >= FACE_CONFIRM_FRAMES) {
         setFaceState('PRESENT');
         setFaceDetected(true);
+        absenceStartTimeRef.current = null;
         absenceTimerRef.current = 0;
         setAbsenceTimerDisplay(0);
         engagementStats.current.faceDetectedFrames += 1;
@@ -428,15 +851,18 @@ export default function InterviewPage() {
         setFaceDetected(false);
 
         if (isSetupCompleteRef.current) {
-          const elapsed = (Date.now() - lastAbsenceTick.current) / 1000;
-          const clamped = Math.min(0.4, Math.max(0.15, elapsed));
-          absenceTimerRef.current += clamped;
-          const currentAbsence = Math.round(absenceTimerRef.current * 10) / 10;
+          const now = Date.now();
+          if (!absenceStartTimeRef.current) {
+            absenceStartTimeRef.current = now;
+          }
+
+          const elapsedSec = (now - absenceStartTimeRef.current) / 1000;
+          const currentAbsence = Math.round(elapsedSec * 10) / 10;
           setAbsenceTimerDisplay(currentAbsence);
 
-          if (currentAbsence >= 1.0) {
+          if (elapsedSec >= 1.0) {
             triggerViolation('ABSENT_USER', `Candidate out of camera frame (${currentAbsence.toFixed(1)}s)!`, 1);
-            absenceTimerRef.current = 0;
+            absenceStartTimeRef.current = now;
             setAbsenceTimerDisplay(0);
           }
         }
@@ -514,6 +940,13 @@ export default function InterviewPage() {
     socket.on("connect", () => {
       console.log("🔌 [WEBSOCKET] Connected to ML server with ID:", socket.id);
       setSocketStatus('CONNECTED');
+      if (sessionIdRef.current) {
+        proctoringEngine.start({
+          socket,
+          sessionId: sessionIdRef.current,
+          getCurrentTurn: () => messages.filter((m) => m.role === 'assistant').length,
+        });
+      }
       // Reset flight flag on reconnect to resume frame transmission
       isInferenceInFlight.current = false;
       if (latestPendingFrame.current) {
@@ -540,14 +973,15 @@ export default function InterviewPage() {
     });
 
     return () => {
+      proctoringEngine.stop();
       socket.disconnect();
     };
   }, []);
 
-  // Draw ML Bounding Boxes with Responsive Scaling
+  // Draw ML Bounding Boxes with Responsive Scaling (Canvas cleared for clean video feed)
   const drawBoundingBoxes = (
-    faces: Array<{ x: number; y: number; width: number; height: number; confidence: number }>,
-    objects: Array<{ class: string; confidence: number; x: number; y: number; width: number; height: number }>,
+    _faces: Array<{ x: number; y: number; width: number; height: number; confidence: number }>,
+    _objects: Array<{ class: string; confidence: number; x: number; y: number; width: number; height: number }>,
     videoWidth: number,
     videoHeight: number
   ) => {
@@ -562,59 +996,6 @@ export default function InterviewPage() {
     canvas.width = displayWidth;
     canvas.height = displayHeight;
     ctx.clearRect(0, 0, displayWidth, displayHeight);
-
-    const scaleX = displayWidth / (videoWidth || 320);
-    const scaleY = displayHeight / (videoHeight || 240);
-
-    // 1. Draw Faces (Emerald Green)
-    faces.forEach((face) => {
-      const fx = Math.round(face.x * scaleX);
-      const fy = Math.round(face.y * scaleY);
-      const fw = Math.round(face.width * scaleX);
-      const fh = Math.round(face.height * scaleY);
-
-      ctx.strokeStyle = '#10b981';
-      ctx.lineWidth = 2.5;
-      ctx.fillStyle = 'rgba(16, 185, 129, 0.15)';
-      ctx.strokeRect(fx, fy, fw, fh);
-      ctx.fillRect(fx, fy, fw, fh);
-
-      // Label Pill
-      const label = `Face ${(face.confidence * 100).toFixed(0)}%`;
-      ctx.fillStyle = '#10b981';
-      ctx.font = 'bold 11px monospace';
-      const textWidth = ctx.measureText(label).width;
-      ctx.fillRect(fx, Math.max(0, fy - 18), textWidth + 8, 18);
-      ctx.fillStyle = '#000000';
-      ctx.fillText(label, fx + 4, Math.max(12, fy - 4));
-    });
-
-    // 2. Draw Objects
-    objects.forEach((obj) => {
-      const ox = Math.round(obj.x * scaleX);
-      const oy = Math.round(obj.y * scaleY);
-      const ow = Math.round(obj.width * scaleX);
-      const oh = Math.round(obj.height * scaleY);
-
-      const isUnauthorized = ['cell phone', 'phone', 'remote', 'laptop', 'book', 'tablet', 'tv', 'keyboard'].includes(obj.class.toLowerCase());
-      const strokeColor = isUnauthorized ? '#f43f5e' : '#06b6d4';
-      const fillColor = isUnauthorized ? 'rgba(244, 63, 94, 0.20)' : 'rgba(6, 182, 212, 0.08)';
-
-      ctx.strokeStyle = strokeColor;
-      ctx.lineWidth = isUnauthorized ? 3 : 1.5;
-      ctx.fillStyle = fillColor;
-      ctx.strokeRect(ox, oy, ow, oh);
-      ctx.fillRect(ox, oy, ow, oh);
-
-      // Label
-      const label = `${isUnauthorized ? '🚨 ' : ''}${obj.class.toUpperCase()} ${(obj.confidence * 100).toFixed(0)}%`;
-      ctx.fillStyle = strokeColor;
-      ctx.font = 'bold 10px monospace';
-      const textWidth = ctx.measureText(label).width;
-      ctx.fillRect(ox, Math.max(0, oy - 16), textWidth + 8, 16);
-      ctx.fillStyle = '#ffffff';
-      ctx.fillText(label, ox + 4, Math.max(11, oy - 4));
-    });
   };
 
   // Real-Time Frame Inference Loop (Runs smoothly at 10 FPS with temporal and memory optimization)
@@ -627,6 +1008,33 @@ export default function InterviewPage() {
       const video = videoRef.current;
 
       if (video.readyState < video.HAVE_METADATA || video.videoWidth === 0) return;
+
+      // Process MediaPipe Eye Tracking Frame (Gaze, Scanpath, Away, Fixations)
+      try {
+        const gaze = eyeTracker.processFrame(video);
+        if (gaze) {
+          setCurrentGaze(gaze);
+          proctoringEngine.reportGaze(gaze.direction, gaze.isAway);
+        }
+        proctoringEngine.processLandmarks(eyeTracker.latestLandmarks, video);
+
+        // Check for Cheating Pattern Alerts (Off-screen reading, concealed phone, corner glances)
+        const patternAlert = eyeTracker.consumePendingPatternAlert();
+        if (patternAlert && isSetupCompleteRef.current) {
+          let eventType = 'OFF_SCREEN_READING';
+          if (patternAlert.type === 'CONCEALED_PHONE_GAZE') eventType = 'CONCEALED_PHONE_GAZE';
+          else if (patternAlert.type === 'REPEATED_CORNER_GLANCES') eventType = 'SUSPICIOUS_CORNER_GLANCES';
+
+          triggerViolation(
+            eventType,
+            patternAlert.description,
+            patternAlert.points,
+            { confidence: patternAlert.confidence, gazeDirection: gaze?.direction }
+          );
+        }
+      } catch {
+        // Non-blocking
+      }
 
       const captureStart = performance.now();
       const frameId = frameCounter.current + 1;
@@ -746,40 +1154,97 @@ export default function InterviewPage() {
     if (isRecording) {
       const blob = await stopRecording();
       setIsProcessing(true);
+
+      const activeSessionId = sessionId || sessionIdRef.current;
+      if (socketRef.current && activeSessionId) {
+        socketRef.current.emit('voice_stream_end', {
+          sessionId: activeSessionId,
+        });
+      }
       
       try {
+        if (!blob || blob.size < 500) {
+          toast.info("Audio recording was too short. Please speak clearly into your microphone.");
+          setIsProcessing(false);
+          return;
+        }
+
         // 1. Send Audio to STT
         const transcript = await transcribeAudioAPI(blob);
         
-        if (!transcript.trim()) {
-           console.log("Empty transcript, please try again.");
-           setIsProcessing(false);
-           return;
+        if (!transcript || !transcript.trim()) {
+          toast.info("No clear speech detected. Please speak into your microphone and try again.");
+          setIsProcessing(false);
+          return;
         }
 
         // Add User Message
         addMessage({
-          id: Math.random().toString(),
+          id: `msg_user_${Date.now()}_${Math.random()}`,
           role: "user",
           content: transcript,
         });
 
-        const activeSessionId = sessionId || sessionIdRef.current;
         if (!activeSessionId) {
           throw new Error("No active session found. Please wait or refresh the interview.");
         }
 
-        // 2. Fetch AI Response
-        const reply = await respondInterviewAPI(activeSessionId, transcript);
-        
-        addMessage({
-          id: Math.random().toString(),
-          role: "assistant",
-          content: reply.reply,
-        });
+        const silenceSec = recordedSilenceSecRef.current;
+        const ttsDur = kokoroTTS.ttsDurationSec;
 
-        if (reply.cutoff) {
-          await handleFinish();
+        // 2. Fetch AI Response with silence and TTS metrics
+        const reply = await respondInterviewAPI(activeSessionId, transcript, silenceSec, ttsDur);
+        
+        setPerQuestionLatencies((prev) => [
+          ...prev,
+          {
+            turn: prev.length + 1,
+            question: messages.filter((m) => m.role === "assistant").slice(-1)[0]?.content || "Question",
+            silenceDurationSec: silenceSec,
+            ttsDurationSec: ttsDur,
+          },
+        ]);
+
+        if (reply.codeChallenge || reply.coding) {
+          const challenge = reply.codeChallenge || {
+            id: `challenge-${Date.now()}`,
+            title: "Live Technical Implementation Challenge",
+            repoName: "technical-assessment",
+            functionName: "solveChallenge",
+            language: "typescript",
+            description: reply.reply,
+            expectedBehavior: "Production-ready solution handling edge cases.",
+            starterCode: `// Write your implementation below\nfunction solveChallenge() {\n  // TODO\n}\n`,
+          };
+          setActiveCodeChallenge(challenge);
+          setCodeSolution(challenge.starterCode);
+          toast.info("Live Code Assessment Activated", {
+            description: `Review the problem prompt and write your solution directly in the code editor below.`,
+          });
+        }
+
+        if (reply.cutoff || reply.shouldCutoff) {
+          if (reply.reply) {
+            addMessage({
+              id: `msg_asst_${Date.now()}_${Math.random()}`,
+              role: "assistant",
+              content: reply.reply,
+            });
+          }
+          toast.success("Interview Complete", {
+            description: "You have answered all 10 questions. Generating your evaluation...",
+          });
+          setTimeout(async () => {
+            await handleFinish();
+          }, 3000);
+        } else {
+          if (reply.reply) {
+            addMessage({
+              id: `msg_asst_${Date.now()}_${Math.random()}`,
+              role: "assistant",
+              content: reply.reply,
+            });
+          }
         }
 
       } catch (error: any) {
@@ -792,7 +1257,18 @@ export default function InterviewPage() {
       }
     } else {
       try {
-        await startRecording();
+        // Candidate is about to respond -> Stop silence/hesitation stopwatch
+        stopSilenceStopwatch();
+        const activeSessionId = sessionId || sessionIdRef.current;
+        await startRecording((chunk, seq) => {
+          if (socketRef.current && socketRef.current.connected && activeSessionId) {
+            socketRef.current.emit('voice_stream_chunk', {
+              sessionId: activeSessionId,
+              seq,
+              isFinal: false,
+            });
+          }
+        });
       } catch (err: any) {
         toast.error("Microphone Access Denied", {
            description: "Please allow microphone access in your browser settings to continue the interview."
@@ -817,14 +1293,30 @@ export default function InterviewPage() {
 
       const reply = await respondInterviewAPI(activeSessionId, "Please ask the next question or give me another scenario.");
       
-      addMessage({
-        id: Math.random().toString(),
-        role: "assistant",
-        content: reply.reply,
-      });
+      if (reply.codeChallenge || reply.coding) {
+        const challenge = reply.codeChallenge || {
+          id: `challenge-${Date.now()}`,
+          title: "Live Technical Implementation Challenge",
+          repoName: "technical-assessment",
+          functionName: "solveChallenge",
+          language: "typescript",
+          description: reply.reply,
+          expectedBehavior: "Clean, production-ready solution handling edge cases.",
+          starterCode: `// Write your implementation below\nfunction solveChallenge() {\n  // TODO\n}\n`,
+        };
+        setActiveCodeChallenge(challenge);
+        setCodeSolution(challenge.starterCode);
+      }
 
-      if (reply.cutoff) {
+      if (reply.cutoff && (messages.filter((m) => m.role === "user").length >= 10 || isTimeExpired)) {
         await handleFinish();
+      } else {
+        // Adding assistant message triggers speech once via centralized useEffect
+        addMessage({
+          id: `msg_asst_${Date.now()}_${Math.random()}`,
+          role: "assistant",
+          content: reply.reply,
+        });
       }
 
     } catch (error: any) {
@@ -837,50 +1329,205 @@ export default function InterviewPage() {
     }
   };
 
+  const handleSubmitCodeSolution = async () => {
+    if (!activeCodeChallenge || !codeSolution.trim()) return;
+    setIsSubmittingCode(true);
+    try {
+      const activeSessionId = sessionId || sessionIdRef.current;
+      if (!activeSessionId) {
+        throw new Error("No active session found. Please wait or refresh the interview.");
+      }
+
+      const challengeSnapshot = activeCodeChallenge;
+      const formattedCodeMsg = `[Submitted Code Implementation for ${challengeSnapshot.functionName} (${challengeSnapshot.language})]:\n\`\`\`${challengeSnapshot.language}\n${codeSolution}\n\`\`\``;
+
+      addMessage({
+        id: Math.random().toString(),
+        role: "user",
+        content: formattedCodeMsg,
+      });
+
+      const silenceSec = recordedSilenceSecRef.current;
+      const ttsDur = kokoroTTS.ttsDurationSec;
+
+      // Close the code editor active view
+      setActiveCodeChallenge(null);
+
+      // Submit code payload to backend
+      const reply = await respondInterviewAPI(
+        activeSessionId,
+        formattedCodeMsg,
+        silenceSec,
+        ttsDur,
+        {
+          code: codeSolution,
+          language: challengeSnapshot.language,
+          challengeId: challengeSnapshot.id,
+          repoName: challengeSnapshot.repoName,
+        }
+      );
+
+      if (reply.codeChallenge) {
+        setActiveCodeChallenge(reply.codeChallenge);
+        setCodeSolution(reply.codeChallenge.starterCode);
+      }
+
+      if (reply.cutoff && (messages.filter((m) => m.role === "user").length >= 10 || isTimeExpired)) {
+        await handleFinish();
+      } else {
+        // Adding assistant message triggers speech once via centralized useEffect
+        addMessage({
+          id: `msg_asst_${Date.now()}_${Math.random()}`,
+          role: "assistant",
+          content: reply.reply,
+        });
+      }
+
+      toast.success("Code Evaluated & Submitted", {
+        description: `Your implementation for ${challengeSnapshot.functionName} was analyzed. Lumina AI is asking a technical follow-up.`,
+      });
+    } catch (error: any) {
+      console.error("Failed to submit code implementation", error);
+      toast.error("Error Submitting Code", {
+        description: error?.response?.data?.message || error.message || "Failed to submit code implementation. Please try again.",
+      });
+    } finally {
+      setIsSubmittingCode(false);
+    }
+  };
+
   const handleFinish = async () => {
     setIsEvaluating(true);
+    kokoroTTS.stopAudio();
+    stopSilenceStopwatch();
+    proctoringEngine.stop();
+
     let score = 0;
     if (engagementStats.current.totalFrames > 0) {
        score = Math.round((engagementStats.current.faceDetectedFrames / engagementStats.current.totalFrames) * 10);
     }
+
+    // Capture complete eye tracking telemetry from MediaPipe FaceLandmarker
+    const eyeTelemetry = eyeTracker.getTelemetry();
     
     try {
-      const evaluationResult = await evaluateInterviewAPI(sessionId!, Math.max(1, score), cheatFlags.current);
-      setEvaluation(evaluationResult);
+      const evaluationResult = await evaluateInterviewAPI(
+        sessionId!,
+        Math.max(1, score),
+        cheatFlags.current,
+        eyeTelemetry
+      );
+      if (evaluationResult) {
+        evaluationResult.eyeTrackingData = eyeTelemetry;
+        evaluationResult.responseLatencies = perQuestionLatencies;
+        setEvaluation(evaluationResult);
+      }
       setShowFeedbackModal(true);
     } catch (error: any) {
-      console.error("Evaluation failed", error);
-      toast.error("Evaluation Error", {
-        description: "Encountered an issue generating the final report. Retrying might solve this."
-      });
+      console.error("Evaluation completed in background:", error);
+      setShowFeedbackModal(true);
+    } finally {
       setIsEvaluating(false);
     }
   };
 
+  const handleConcludeClick = () => {
+    const userMsgCount = messages.filter((m) => m.role === "user").length;
+    if (userMsgCount >= 10 || isTimeExpired) {
+      handleFinish();
+    } else {
+      setShowConcludeEarlyModal(true);
+    }
+  };
+
+  const handleConfirmConcludeEarly = async () => {
+    setShowConcludeEarlyModal(false);
+    setIsConcludingEarly(true);
+    kokoroTTS.stopAudio();
+    stopSilenceStopwatch();
+    proctoringEngine.stop();
+
+    try {
+      const activeSessionId = sessionId || sessionIdRef.current;
+      if (activeSessionId) {
+        await concludeEarlyAPI(activeSessionId, "Candidate concluded interview early in between session.");
+      }
+      setShowFeedbackModal(true);
+    } catch (error: any) {
+      console.error("Failed to conclude early:", error);
+      setShowFeedbackModal(true);
+    } finally {
+      setIsConcludingEarly(false);
+    }
+  };
+
   const handleStartInterview = async () => {
+    if (!hasClosedOtherTabs) {
+      toast.error("Browser Tabs Check Required", {
+        description: "Please close all other browser tabs and check the confirmation box.",
+      });
+      return;
+    }
+
+    // Ensure fullscreen is active before entering interview
+    const inFullscreen = !!(
+      document.fullscreenElement ||
+      (document as any).webkitFullscreenElement ||
+      (document as any).mozFullScreenElement ||
+      (document as any).msFullscreenElement
+    );
+
+    if (!inFullscreen) {
+      try {
+        await requestFullscreenMode();
+      } catch (e) {
+        toast.error("Fullscreen Required", {
+          description: "Exclusive fullscreen is required to hide tabs and ensure exam integrity.",
+        });
+        return;
+      }
+    }
+
     setIsStartingInterview(true);
     setIsSetupComplete(true); // Transition immediately to interview page
     try {
-      const candidateEmail = user?.email;
-      const candidateName = user?.name || (candidateEmail ? candidateEmail.split("@")[0] : "Candidate");
-      
-      const apiData = await startInterviewAPI(candidateName, candidateEmail);
+      const activeSessionId = sessionId || sessionIdRef.current;
+      const existingFirstMsg = messages.find((m) => m.role === "assistant");
 
-      if (apiData) {
-        setSessionId(apiData.sessionId);
-        addMessage({
-          id: "msg_first",
-          role: "assistant",
-          content: apiData.question,
-        });
+      if (activeSessionId && existingFirstMsg) {
         toast.success("Interview Started", {
-          description: "AI Interviewer is ready. Speak clearly into your microphone."
+          description: "AI Interviewer is ready. Speak clearly into your microphone.",
         });
+        return;
       }
+
+      if (activeSessionId) {
+        const candidateEmail = user?.email;
+        const candidateName = user?.name || (candidateEmail ? candidateEmail.split("@")[0] : "Candidate");
+        const apiData = await startInterviewAPI(candidateName, candidateEmail);
+
+        if (apiData) {
+          setSessionId(apiData.sessionId);
+          addMessage({
+            id: `msg_first_${Date.now()}`,
+            role: "assistant",
+            content: apiData.question,
+          });
+          toast.success("Interview Started", {
+            description: "AI Interviewer is ready. Speak clearly into your microphone.",
+          });
+        }
+        return;
+      }
+
+      toast.error("Invitation Required", {
+        description: "Please access your interview through the recruiter invitation link.",
+      });
+      router.push("/");
     } catch (err: any) {
       console.error("Failed to start session:", err);
       toast.error("Failed to start interview", {
-        description: err?.message || "Please check backend connection and retry."
+        description: err?.message || "Please check backend connection and retry.",
       });
       setSessionFailed(true);
     } finally {
@@ -894,18 +1541,24 @@ export default function InterviewPage() {
       return;
     }
     setIsSubmittingFeedback(true);
+    const activeSessionId = sessionId || sessionIdRef.current;
     try {
-      await submitFeedbackAPI(sessionId!, feedbackText);
-      toast.success("Feedback submitted!");
-      router.push("/dashboard");
+      if (activeSessionId) {
+        await submitFeedbackAPI(activeSessionId, feedbackText);
+      }
+      toast.success("Feedback submitted! Thank you.");
     } catch (error) {
-      toast.error("Failed to submit feedback.");
+      console.error("Failed to submit feedback:", error);
+    } finally {
       setIsSubmittingFeedback(false);
+      setShowFeedbackModal(false);
+      setIsInterviewCompleted(true);
     }
   };
 
   const handleSkipFeedback = () => {
-      router.push("/dashboard");
+    setShowFeedbackModal(false);
+    setIsInterviewCompleted(true);
   };
 
   return (
@@ -918,6 +1571,39 @@ export default function InterviewPage() {
           <p className="text-zinc-500 text-sm mt-2">The OpenAI back-end might be unreachable or timed out.</p>
           <Button onClick={() => router.push('/')} className="mt-6 bg-zinc-800 text-white">Return to Secure Hub</Button>
        </div>
+      )}
+
+      {/* FULLSCREEN LOCK ENFORCEMENT OVERLAY */}
+      {isSetupComplete && !isInterviewCompleted && !isFullscreen && (
+        <div className="fixed inset-0 z-[200] bg-black/95 backdrop-blur-2xl flex flex-col items-center justify-center p-6 text-center animate-in fade-in duration-200">
+          <div className="max-w-md w-full p-8 rounded-3xl bg-zinc-950 border border-rose-500/40 shadow-2xl space-y-5">
+            <div className="w-16 h-16 mx-auto rounded-2xl bg-rose-500/10 border border-rose-500/30 flex items-center justify-center text-rose-400">
+              <Maximize2 className="w-8 h-8 animate-pulse" />
+            </div>
+            <div className="space-y-2">
+              <h3 className="text-xl font-bold text-white tracking-tight">Fullscreen Mode Required</h3>
+              <p className="text-xs text-zinc-300 leading-relaxed">
+                You have exited fullscreen mode or navigated away from the interview tab. All other browser tabs and external applications must remain hidden during this assessment.
+              </p>
+            </div>
+
+            <div className="p-3.5 rounded-xl bg-rose-500/10 border border-rose-500/20 text-rose-300 text-xs text-left space-y-1">
+              <span className="font-bold flex items-center gap-1.5 text-[11px] uppercase tracking-wider text-rose-400">
+                <AlertCircle className="w-3.5 h-3.5" /> Integrity Violation Logged
+              </span>
+              <p className="text-[11px] text-zinc-300 leading-relaxed">
+                Exiting fullscreen has been logged in your recruiter proctoring audit dossier. Please re-enter fullscreen immediately to resume the evaluation.
+              </p>
+            </div>
+
+            <Button
+              onClick={requestFullscreenMode}
+              className="w-full py-6 text-base font-bold bg-gradient-to-r from-cyan-500 via-teal-500 to-emerald-500 hover:opacity-95 text-white rounded-2xl shadow-[0_0_25px_rgba(6,182,212,0.4)] cursor-pointer flex items-center justify-center gap-2"
+            >
+              <Maximize2 className="w-5 h-5" /> Re-enter Fullscreen & Resume
+            </Button>
+          </div>
+        </div>
       )}
 
       {/* Boot Sequencer Loading Screen */}
@@ -956,207 +1642,382 @@ export default function InterviewPage() {
       <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-full h-full bg-[radial-gradient(ellipse_at_center,_var(--tw-gradient-stops))] from-violet-900/10 via-black to-black pointer-events-none" />
       <div className="absolute top-0 right-0 w-[500px] h-[500px] bg-cyan-900/20 blur-[150px] rounded-full pointer-events-none" />
 
-      {/* PERSISTENT CAMERA FEED WRAPPER (Never unmounts, transitions styling smoothly) */}
-      <div 
-        onClick={!isSetupComplete && !isVideoActive ? requestCameraAccess : undefined}
-        className={`z-20 border border-white/10 shadow-2xl transition-all duration-500 ease-in-out overflow-hidden bg-black ${
-          !isSetupComplete 
-            ? "absolute top-[40%] left-1/2 -translate-x-1/2 -translate-y-1/2 w-full max-w-md aspect-video rounded-2xl" 
-            : "absolute top-24 right-6 w-48 h-64 rounded-xl"
-        }`}
-      >
-        {/* Status Pill on Camera Feed */}
-        <div className="absolute top-3 left-3 z-30 flex items-center gap-2 bg-black/70 backdrop-blur-md px-3 py-1.5 rounded-full border border-white/10">
-          <span className={`w-2 h-2 rounded-full ${faceState === 'PRESENT' ? 'bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.8)]' : isVideoActive ? 'bg-emerald-400' : 'bg-amber-400 animate-pulse'}`} />
-          <span className="text-[10px] font-bold uppercase tracking-wider text-zinc-200">
-            {faceState === 'PRESENT' ? "Face Verified" : isVideoActive ? "Camera Live" : "Camera Offline"}
-          </span>
-        </div>
-
-        {!isVideoActive && (
-          <div className="w-full h-full flex flex-col items-center justify-center gap-2 text-zinc-500">
-             <CameraOff className="w-6 h-6" />
-             <span className="text-xs uppercase">No Signal</span>
-          </div>
-        )}
-
-        <video 
-          ref={attachVideoRef} 
-          autoPlay 
-          playsInline 
-          muted 
-          className="w-full h-full object-cover"
-        />
-
-        {/* Real-time Server ML Canvas Overlay */}
-        <canvas 
-          ref={canvasOverlayRef}
-          className="absolute inset-0 w-full h-full pointer-events-none z-10"
-        />
-
-        {/* Live Server Inference Latency Pill */}
-        {isVideoActive && (
-          <div className="absolute bottom-3 right-3 z-30 flex items-center gap-1.5 bg-black/70 backdrop-blur-md px-2.5 py-1 rounded-full border border-white/10 text-[9px] text-zinc-300 font-mono">
-            <span className="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-pulse" />
-            <span>Server Vision: {inferenceLatency}ms</span>
-          </div>
-        )}
-      </div>
-
-      {/* SETUP & CALIBRATION VIEW */}
+      {/* SETUP & CALIBRATION VIEW (Fits 100% of screen without requiring 60% browser zoom) */}
       {!isSetupComplete ? (
-        <div className="z-10 flex-1 flex flex-col items-center justify-center p-6 max-w-2xl mx-auto w-full">
-          <div className="w-full bg-zinc-900/60 border border-white/10 backdrop-blur-2xl rounded-3xl p-8 shadow-2xl flex flex-col items-center gap-6">
+        <div className="z-10 flex-1 flex flex-col justify-center items-center p-4 md:p-6 w-full max-w-6xl mx-auto overflow-y-auto">
+          <div className="w-full bg-zinc-900/70 border border-white/10 backdrop-blur-2xl rounded-3xl p-5 md:p-7 shadow-2xl flex flex-col gap-5 my-auto">
             
-            <div className="text-center space-y-1">
-              <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-cyan-500/10 border border-cyan-500/20 text-cyan-400 text-xs font-semibold uppercase tracking-wider mb-2">
-                <span className="w-2 h-2 rounded-full bg-cyan-400 animate-pulse" />
-                AI Proctoring Setup
-              </div>
-              <h1 className="text-2xl md:text-3xl font-bold text-white tracking-tight">Camera & Face Verification</h1>
-              <p className="text-zinc-400 text-sm max-w-md mx-auto">
-                Position yourself in the frame. The interview will unlock automatically once your face is recognized and the security check completes.
-              </p>
-            </div>
-
-            {/* Live Camera Preview Placeholder (Spacer for persistent absolute overlay) */}
-            <div className="w-full max-w-md aspect-video rounded-2xl pointer-events-none bg-zinc-950/40 border border-white/5" />
-
-            {/* Verification Checklist (Camera, Microphone, Face) */}
-            <div className="w-full max-w-md grid grid-cols-3 gap-2 text-xs">
-              <div className="flex flex-col items-center justify-center p-3 rounded-xl bg-black/40 border border-white/5 text-zinc-300 text-center gap-1.5">
-                <div className={`w-5 h-5 rounded-full flex items-center justify-center font-bold text-[11px] ${isVideoActive ? 'bg-emerald-500/20 text-emerald-400' : 'bg-zinc-800 text-zinc-500'}`}>
-                  {isVideoActive ? "✓" : "●"}
+            {/* Setup Header */}
+            <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 pb-3 border-b border-white/10">
+              <div className="space-y-1">
+                <div className="inline-flex items-center gap-2 px-3 py-0.5 rounded-full bg-cyan-500/10 border border-cyan-500/20 text-cyan-400 text-xs font-semibold uppercase tracking-wider">
+                  <span className="w-2 h-2 rounded-full bg-cyan-400 animate-pulse" />
+                  Pre-Flight Verification
                 </div>
-                <span className="text-[11px]">Camera</span>
+                <h1 className="text-xl md:text-2xl font-bold text-white tracking-tight">Camera & System Verification</h1>
+                <p className="text-zinc-400 text-xs md:text-sm">
+                  Position your face clearly in the camera. All hardware and environment checks must pass before unlocking.
+                </p>
               </div>
-              <div className="flex flex-col items-center justify-center p-3 rounded-xl bg-black/40 border border-white/5 text-zinc-300 text-center gap-1.5">
-                <div className={`w-5 h-5 rounded-full flex items-center justify-center font-bold text-[11px] ${isMicActive ? 'bg-emerald-500/20 text-emerald-400' : 'bg-zinc-800 text-zinc-500'}`}>
-                  {isMicActive ? "✓" : "●"}
-                </div>
-                <span className="text-[11px]">Microphone</span>
-              </div>
-              <div className="flex flex-col items-center justify-center p-3 rounded-xl bg-black/40 border border-white/5 text-zinc-300 text-center gap-1.5">
-                <div className={`w-5 h-5 rounded-full flex items-center justify-center font-bold text-[11px] ${faceState === 'PRESENT' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-amber-500/20 text-amber-400 animate-pulse'}`}>
-                  {faceState === 'PRESENT' ? "✓" : "●"}
-                </div>
-                <span className="text-[11px]">Face Detected</span>
-              </div>
-            </div>
 
-            {/* AI Monitoring Pre-Flight Check */}
-            <div className="w-full max-w-md p-4 rounded-2xl bg-black/40 border border-white/5 space-y-2.5 text-xs text-zinc-300 font-mono">
-              <div className="text-zinc-400 font-bold uppercase tracking-wider text-[10px] pb-1.5 border-b border-white/5 flex justify-between items-center">
-                <span>AI Monitoring Status</span>
-                <span className={
-                  isVideoActive && isMicActive && faceState === 'PRESENT' && socketStatus === 'CONNECTED' && inferenceLatency > 0
-                    ? "text-emerald-400 font-bold animate-pulse"
-                    : "text-amber-400 font-bold"
-                }>
-                  {isVideoActive && isMicActive && faceState === 'PRESENT' && socketStatus === 'CONNECTED' && inferenceLatency > 0 ? "✓ READY TO START" : "● INITIALIZING"}
+              <div className="flex items-center gap-2 self-start sm:self-center">
+                <span className={`px-3 py-1.5 rounded-full text-xs font-mono font-bold border flex items-center gap-1.5 ${
+                  isVideoActive && isMicActive && faceState === 'PRESENT' && socketStatus === 'CONNECTED' && isFullscreen && hasClosedOtherTabs
+                    ? "bg-emerald-500/20 border-emerald-500/40 text-emerald-300"
+                    : "bg-amber-500/10 border-amber-500/30 text-amber-300 animate-pulse"
+                }`}>
+                  <span className={`w-2 h-2 rounded-full ${
+                    isVideoActive && isMicActive && faceState === 'PRESENT' && socketStatus === 'CONNECTED' && isFullscreen && hasClosedOtherTabs
+                      ? "bg-emerald-400"
+                      : "bg-amber-400"
+                  }`} />
+                  {isVideoActive && isMicActive && faceState === 'PRESENT' && socketStatus === 'CONNECTED' && isFullscreen && hasClosedOtherTabs
+                    ? "READY TO START"
+                    : "VERIFYING CHECKS"}
                 </span>
               </div>
-              
-              <div className="space-y-1.5 text-[10px]">
-                <div className="flex justify-between items-center">
-                  <span className="text-zinc-500">Camera permission & stream:</span>
-                  <span className={isVideoActive ? "text-emerald-400" : "text-rose-400 font-bold"}>
-                    {isVideoActive ? "✓ ACTIVE" : "✗ PENDING"}
-                  </span>
-                </div>
-                <div className="flex justify-between items-center">
-                  <span className="text-zinc-500">Microphone permission:</span>
-                  <span className={isMicActive ? "text-emerald-400" : "text-rose-400 font-bold"}>
-                    {isMicActive ? "✓ ACTIVE" : "✗ PENDING"}
-                  </span>
-                </div>
-                <div className="flex justify-between items-center">
-                  <span className="text-zinc-500">Face verify (YOLO26 AI Proctor):</span>
-                  <span className={faceState === 'PRESENT' ? "text-emerald-400" : "text-amber-400"}>
-                    {faceState === 'PRESENT' ? "✓ VERIFIED" : "● POSITION FACE IN FRAME"}
-                  </span>
-                </div>
-                <div className="flex justify-between items-center">
-                  <span className="text-zinc-500">Real-time WebSocket tunnel:</span>
-                  <span className={socketStatus === 'CONNECTED' ? "text-emerald-400" : "text-amber-400"}>
-                    {socketStatus === 'CONNECTED' ? "✓ CONNECTED" : "● CONNECTING..."}
-                  </span>
-                </div>
-                <div className="flex justify-between items-center">
-                  <span className="text-zinc-500">Server ML model response:</span>
-                  <span className={inferenceLatency > 0 ? "text-emerald-400" : "text-amber-400"}>
-                    {inferenceLatency > 0 ? "✓ RESPONDING" : "● WAITING FOR FIRST RESPONSE..."}
-                  </span>
-                </div>
-              </div>
             </div>
 
-            {/* Start Action Gated on Pre-Flight Checks */}
-            <div className="w-full max-w-md pt-2">
-              <Button
-                size="lg"
-                onClick={handleStartInterview}
-                disabled={isStartingInterview || !isVideoActive || !isMicActive || faceState !== 'PRESENT' || socketStatus !== 'CONNECTED' || inferenceLatency === 0}
-                className={`w-full py-6 text-base font-semibold rounded-2xl transition-all duration-300 ${
-                  isVideoActive && isMicActive && faceState === 'PRESENT' && socketStatus === 'CONNECTED' && inferenceLatency > 0
-                    ? 'bg-gradient-to-r from-emerald-500 via-teal-500 to-cyan-500 hover:opacity-95 text-white shadow-[0_0_30px_rgba(16,185,129,0.4)] cursor-pointer' 
-                    : 'bg-zinc-800 text-zinc-400 border border-zinc-700/50 cursor-not-allowed'
-                }`}
-              >
-                {isStartingInterview ? (
-                  <span className="flex items-center gap-2">
-                    <Loader2 className="w-5 h-5 animate-spin" />
-                    Starting AI Session...
-                  </span>
-                ) : isVideoActive && isMicActive && faceState === 'PRESENT' && socketStatus === 'CONNECTED' && inferenceLatency > 0 ? (
-                  <span className="flex items-center gap-2">
-                    Start Interview Now <ArrowRight className="w-5 h-5" />
-                  </span>
-                ) : (
-                  <span className="flex items-center gap-2">
-                    <Loader2 className="w-4 h-4 animate-spin" />
-                    AI Monitoring Initializing...
-                  </span>
-                )}
-              </Button>
+            {/* 2-Column Responsive Grid */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5 items-start">
+              
+              {/* Left Column: Live Camera + 4 Badges + System Readiness */}
+              <div className="space-y-3">
+                {/* Live Camera Preview Box */}
+                <div 
+                  onClick={!isVideoActive ? requestCameraAccess : undefined}
+                  className="relative w-full aspect-video rounded-2xl overflow-hidden bg-black border border-white/10 shadow-xl group cursor-pointer"
+                >
+                  <div className="absolute top-2.5 left-2.5 z-30 flex items-center gap-2 bg-black/75 backdrop-blur-md px-3 py-1 rounded-full border border-white/10">
+                    <span className={`w-2 h-2 rounded-full ${isVideoActive ? 'bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.8)]' : 'bg-amber-400 animate-pulse'}`} />
+                    <span className="text-[10px] font-bold uppercase tracking-wider text-zinc-200">
+                      {isVideoActive ? "Camera Active" : "Click to Enable Camera"}
+                    </span>
+                  </div>
+
+                  {!isVideoActive && (
+                    <div className="w-full h-full flex flex-col items-center justify-center gap-2 text-zinc-500">
+                      <CameraOff className="w-8 h-8 text-zinc-600 group-hover:text-cyan-400 transition-colors" />
+                      <span className="text-xs uppercase tracking-wider group-hover:text-zinc-300 transition-colors">Click to enable camera</span>
+                    </div>
+                  )}
+
+                  <video 
+                    ref={attachVideoRef} 
+                    autoPlay 
+                    playsInline 
+                    muted 
+                    className="w-full h-full object-cover"
+                  />
+                  <canvas 
+                    ref={canvasOverlayRef}
+                    className="absolute inset-0 w-full h-full pointer-events-none z-10"
+                  />
+                </div>
+
+                {/* 4 Status Badges */}
+                <div className="grid grid-cols-4 gap-2 text-xs">
+                  <div className="flex flex-col items-center justify-center p-2 rounded-xl bg-black/40 border border-white/5 text-zinc-300 text-center gap-1">
+                    <div className={`w-4 h-4 rounded-full flex items-center justify-center font-bold text-[10px] ${isVideoActive ? 'bg-emerald-500/20 text-emerald-400' : 'bg-zinc-800 text-zinc-500'}`}>
+                      {isVideoActive ? "✓" : "●"}
+                    </div>
+                    <span className="text-[10px]">Camera</span>
+                  </div>
+                  <div className="flex flex-col items-center justify-center p-2 rounded-xl bg-black/40 border border-white/5 text-zinc-300 text-center gap-1">
+                    <div className={`w-4 h-4 rounded-full flex items-center justify-center font-bold text-[10px] ${isMicActive ? 'bg-emerald-500/20 text-emerald-400' : 'bg-zinc-800 text-zinc-500'}`}>
+                      {isMicActive ? "✓" : "●"}
+                    </div>
+                    <span className="text-[10px]">Mic</span>
+                  </div>
+                  <div className="flex flex-col items-center justify-center p-2 rounded-xl bg-black/40 border border-white/5 text-zinc-300 text-center gap-1">
+                    <div className={`w-4 h-4 rounded-full flex items-center justify-center font-bold text-[10px] ${faceState === 'PRESENT' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-amber-500/20 text-amber-400 animate-pulse'}`}>
+                      {faceState === 'PRESENT' ? "✓" : "●"}
+                    </div>
+                    <span className="text-[10px]">Face In View</span>
+                  </div>
+                  <div className="flex flex-col items-center justify-center p-2 rounded-xl bg-black/40 border border-white/5 text-zinc-300 text-center gap-1">
+                    <div className={`w-4 h-4 rounded-full flex items-center justify-center font-bold text-[10px] ${isFullscreen ? 'bg-emerald-500/20 text-emerald-400' : 'bg-amber-500/20 text-amber-400 animate-pulse'}`}>
+                      {isFullscreen ? "✓" : "●"}
+                    </div>
+                    <span className="text-[10px]">Fullscreen</span>
+                  </div>
+                </div>
+
+                {/* Pre-Flight Checklist Card */}
+                <div className="p-3 rounded-2xl bg-black/40 border border-white/5 text-[11px] text-zinc-300 font-mono space-y-1">
+                  <div className="flex justify-between items-center text-zinc-400 font-bold uppercase text-[10px] pb-1 border-b border-white/5">
+                    <span>System Readiness</span>
+                    <span className={socketStatus === 'CONNECTED' ? 'text-emerald-400' : 'text-amber-400'}>
+                      {socketStatus === 'CONNECTED' ? 'ONLINE' : 'CONNECTING...'}
+                    </span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-zinc-500">Camera & Audio Stream:</span>
+                    <span className={isVideoActive && isMicActive ? "text-emerald-400 font-bold" : "text-amber-400 font-bold"}>
+                      {isVideoActive && isMicActive ? "✓ Active" : "● Pending Access"}
+                    </span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-zinc-500">Face Recognition:</span>
+                    <span className={faceState === 'PRESENT' ? "text-emerald-400 font-bold" : "text-amber-400 font-bold"}>
+                      {faceState === 'PRESENT' ? "✓ Face Verified" : "● Position Face In Frame"}
+                    </span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-zinc-500">AI Proctoring Tunnel:</span>
+                    <span className={socketStatus === 'CONNECTED' && inferenceLatency > 0 ? "text-emerald-400 font-bold" : "text-cyan-400"}>
+                      {socketStatus === 'CONNECTED' && inferenceLatency > 0 ? "✓ Connected" : "● Initializing..."}
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+              {/* Right Column: Fullscreen & Tab Removal + Guidelines + Start Button */}
+              <div className="space-y-3 flex flex-col justify-between h-full">
+                
+                {/* Fullscreen & Tab Removal Protocol Card */}
+                <div className="bg-zinc-950/90 p-4 rounded-2xl border border-cyan-500/30 space-y-2.5 shadow-lg">
+                  <div className="flex items-center justify-between pb-1 border-b border-white/5">
+                    <div className="flex items-center gap-1.5 text-cyan-400 font-bold text-xs uppercase tracking-wider">
+                      <Maximize2 className="w-4 h-4 shrink-0" />
+                      <span>Locked Fullscreen Protocol</span>
+                    </div>
+                    <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-cyan-500/10 text-cyan-300 font-bold">
+                      REQUIRED
+                    </span>
+                  </div>
+
+                  <p className="text-xs text-zinc-300 leading-relaxed font-sans">
+                    Close all other browser tabs and external applications. The interview must run in exclusive locked fullscreen mode.
+                  </p>
+
+                  {!isFullscreen ? (
+                    <Button
+                      type="button"
+                      variant="outline"
+                      onClick={requestFullscreenMode}
+                      className="w-full py-4 bg-zinc-900 hover:bg-zinc-800 border-cyan-500/40 text-cyan-300 font-semibold text-xs rounded-xl flex items-center justify-center gap-2 cursor-pointer transition-all shadow-[0_0_15px_rgba(6,182,212,0.1)]"
+                    >
+                      <Maximize2 className="w-4 h-4 text-cyan-400" />
+                      Click to Enter Fullscreen Mode
+                    </Button>
+                  ) : (
+                    <div className="w-full p-2.5 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 text-xs font-semibold flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                        <span>Fullscreen Mode Active</span>
+                      </div>
+                      <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-bold">
+                        LOCKED
+                      </span>
+                    </div>
+                  )}
+
+                  <label className="flex items-start gap-2.5 p-2.5 rounded-xl bg-black/50 border border-white/5 hover:border-cyan-500/30 transition-all cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={hasClosedOtherTabs}
+                      onChange={(e) => setHasClosedOtherTabs(e.target.checked)}
+                      className="mt-0.5 w-4 h-4 rounded border-zinc-700 text-cyan-500 focus:ring-cyan-500/20 bg-zinc-900 cursor-pointer"
+                    />
+                    <div className="text-xs text-zinc-300 space-y-0.5">
+                      <span className="font-semibold text-white block">
+                        I confirm all other browser tabs and external apps are closed
+                      </span>
+                      <span className="text-[11px] text-zinc-400 block leading-tight">
+                        Exiting fullscreen or switching tabs will be logged as an integrity violation.
+                      </span>
+                    </div>
+                  </label>
+                </div>
+
+                {/* Integrity Guidelines Card */}
+                <div className="bg-zinc-950/90 p-3 rounded-2xl border border-amber-500/20 text-xs text-zinc-300 space-y-1.5 shadow-sm">
+                  <div className="flex items-center gap-2 text-amber-400 font-bold text-xs uppercase tracking-wider pb-1 border-b border-white/5">
+                    <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                    <span>Interview Integrity Guidelines</span>
+                  </div>
+                  <div className="grid grid-cols-2 gap-1.5 text-[11px] text-zinc-300">
+                    <div className="flex items-start gap-1">
+                      <span className="text-amber-400 font-bold">•</span>
+                      <span>Quiet, well-lit room</span>
+                    </div>
+                    <div className="flex items-start gap-1">
+                      <span className="text-amber-400 font-bold">•</span>
+                      <span>Keep face inside camera</span>
+                    </div>
+                    <div className="flex items-start gap-1">
+                      <span className="text-amber-400 font-bold">•</span>
+                      <span>Look forward at screen</span>
+                    </div>
+                    <div className="flex items-start gap-1">
+                      <span className="text-amber-400 font-bold">•</span>
+                      <span>No secondary devices/phones</span>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Start Interview Action Button */}
+                <Button
+                  size="lg"
+                  onClick={handleStartInterview}
+                  disabled={
+                    isStartingInterview || 
+                    !isVideoActive || 
+                    !isMicActive || 
+                    faceState !== 'PRESENT' || 
+                    socketStatus !== 'CONNECTED' || 
+                    inferenceLatency === 0 ||
+                    !isFullscreen ||
+                    !hasClosedOtherTabs
+                  }
+                  className={`w-full py-5 text-sm md:text-base font-semibold rounded-2xl transition-all duration-300 ${
+                    isVideoActive && isMicActive && faceState === 'PRESENT' && socketStatus === 'CONNECTED' && inferenceLatency > 0 && isFullscreen && hasClosedOtherTabs
+                      ? 'bg-gradient-to-r from-emerald-500 via-teal-500 to-cyan-500 hover:opacity-95 text-white shadow-[0_0_25px_rgba(16,185,129,0.35)] cursor-pointer' 
+                      : 'bg-zinc-800 text-zinc-400 border border-zinc-700/50 cursor-not-allowed'
+                  }`}
+                >
+                  {isStartingInterview ? (
+                    <span className="flex items-center gap-2">
+                      <Loader2 className="w-5 h-5 animate-spin" /> Starting AI Session...
+                    </span>
+                  ) : !isFullscreen ? (
+                    <span className="flex items-center gap-2">
+                      <Maximize2 className="w-4 h-4 text-cyan-400" /> Enter Fullscreen Above to Unlock
+                    </span>
+                  ) : !hasClosedOtherTabs ? (
+                    <span className="flex items-center gap-2">
+                      <CheckCircle2 className="w-4 h-4 text-amber-400" /> Confirm Tab Checkbox Above
+                    </span>
+                  ) : isVideoActive && isMicActive && faceState === 'PRESENT' && socketStatus === 'CONNECTED' && inferenceLatency > 0 ? (
+                    <span className="flex items-center gap-2">
+                      <Maximize2 className="w-4 h-4" /> Start Interview <ArrowRight className="w-4 h-4" />
+                    </span>
+                  ) : (
+                    <span className="flex items-center gap-2">
+                      <Loader2 className="w-4 h-4 animate-spin" /> Verifying Hardware & Face...
+                    </span>
+                  )}
+                </Button>
+
+              </div>
+
             </div>
 
           </div>
         </div>
       ) : (
         <>
+          {/* Persistent Camera PiP in Interview View */}
+          <div 
+            className="fixed top-20 right-6 z-30 w-44 md:w-52 aspect-video rounded-2xl overflow-hidden bg-black border border-white/10 shadow-[0_10px_40px_rgba(0,0,0,0.8)]"
+          >
+            <div className="absolute top-2 left-2 z-30 flex items-center gap-1.5 bg-black/75 backdrop-blur-md px-2 py-0.5 rounded-full border border-white/10 text-[9px] font-bold uppercase tracking-wider text-zinc-200">
+              <span className={`w-1.5 h-1.5 rounded-full ${isVideoActive ? 'bg-emerald-400 shadow-[0_0_6px_rgba(52,211,153,0.8)]' : 'bg-amber-400 animate-pulse'}`} />
+              <span>{isVideoActive ? "Camera Active" : "Camera Offline"}</span>
+            </div>
+            {!isVideoActive && (
+              <div className="w-full h-full flex flex-col items-center justify-center gap-1 text-zinc-500">
+                <CameraOff className="w-5 h-5" />
+                <span className="text-[10px] uppercase">No Signal</span>
+              </div>
+            )}
+            <video 
+              ref={attachVideoRef} 
+              autoPlay 
+              playsInline 
+              muted 
+              className="w-full h-full object-cover"
+            />
+            <canvas 
+              ref={canvasOverlayRef}
+              className="absolute inset-0 w-full h-full pointer-events-none z-10"
+            />
+          </div>
+
           {/* Header */}
           <header className="px-6 py-4 flex justify-between items-center border-b border-white/5 bg-black/40 backdrop-blur-2xl z-10">
             <div className="flex items-center gap-3 relative">
               <div className="w-2.5 h-2.5 rounded-full bg-cyan-400 shadow-[0_0_12px_rgba(34,211,238,0.8)] animate-pulse" />
               <span className="text-zinc-200 font-semibold tracking-wider uppercase text-xs">Lumina Core Active</span>
+              <span className="text-[11px] font-mono px-2.5 py-0.5 rounded-full bg-cyan-950/70 border border-cyan-800/40 text-cyan-300">
+                Question {Math.min(10, Math.max(1, messages.filter(m => m.role === 'assistant').length))} / 10
+              </span>
             </div>
 
-            {/* Live Security HUD Indicator */}
+            {/* Header Status & Kokoro TTS Audio Controls */}
             <div className="flex items-center gap-3">
-              <div className={`flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold uppercase tracking-wider border backdrop-blur-md transition-all ${
-                violationCount > 0 
-                  ? "bg-rose-500/10 border-rose-500/30 text-rose-400 shadow-[0_0_15px_rgba(244,63,94,0.2)] animate-pulse" 
-                  : "bg-emerald-500/10 border-emerald-500/20 text-emerald-400"
-              }`}>
-                <span className={`w-2 h-2 rounded-full ${violationCount > 0 ? "bg-rose-500" : "bg-emerald-400"}`} />
-                Misconduct Score: {violationCount} pts
+              {/* Barge-In Interruption Indicator */}
+              {isBargeInActive && (
+                <div className="flex items-center gap-2 px-3 py-1 rounded-full bg-amber-500/20 border border-amber-500/40 text-amber-300 text-xs font-semibold backdrop-blur-md animate-pulse">
+                  <Radio className="w-3.5 h-3.5 text-amber-400" />
+                  <span>Candidate Interrupted (Barge-In Active)</span>
+                </div>
+              )}
+
+              {/* Audio Status & Controls */}
+              {kokoroTTS.isPlaying ? (
+                <div className="flex items-center gap-2 px-3 py-1 rounded-full bg-violet-500/10 border border-violet-500/30 text-violet-300 text-xs font-semibold backdrop-blur-md">
+                  <div className="flex items-end gap-0.5 h-3">
+                    <span className="w-0.5 h-full bg-violet-400 animate-pulse" />
+                    <span className="w-0.5 h-2/3 bg-violet-400 animate-pulse delay-75" />
+                    <span className="w-0.5 h-full bg-violet-400 animate-pulse delay-150" />
+                    <span className="w-0.5 h-1/2 bg-violet-400 animate-pulse delay-100" />
+                  </div>
+                  <span>AI Interviewer Speaking...</span>
+                </div>
+              ) : kokoroTTS.isSynthesizing ? (
+                <div className="flex items-center gap-2 px-3 py-1 rounded-full bg-cyan-500/10 border border-cyan-500/30 text-cyan-300 text-xs font-semibold backdrop-blur-md">
+                  <Loader2 className="w-3 h-3 animate-spin text-cyan-400" />
+                  <span>Preparing Audio...</span>
+                </div>
+              ) : kokoroTTS.lastSpokenText ? (
+                <button
+                  type="button"
+                  onClick={() => kokoroTTS.replayLastQuestion()}
+                  className="flex items-center gap-1.5 px-3 py-1 rounded-full bg-white/5 hover:bg-white/10 border border-white/10 text-zinc-300 hover:text-white text-xs font-medium backdrop-blur-md transition-all cursor-pointer"
+                  title="Replay last spoken question"
+                >
+                  <Volume2 className="w-3.5 h-3.5 text-cyan-400" />
+                  <span>Replay Audio</span>
+                </button>
+              ) : null}
+
+              {/* 30-Minute Live Countdown Timer */}
+              <div
+                className={`flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-mono font-medium border backdrop-blur-md transition-all ${
+                  secondsRemaining <= 120
+                    ? "bg-rose-500/10 border-rose-500/30 text-rose-400 animate-pulse shadow-[0_0_12px_rgba(244,63,94,0.3)]"
+                    : secondsRemaining <= 300
+                    ? "bg-amber-500/10 border-amber-500/30 text-amber-300 shadow-[0_0_10px_rgba(245,158,11,0.2)]"
+                    : "bg-white/5 border-white/10 text-cyan-300"
+                }`}
+                title="Interview time remaining"
+              >
+                <Timer className={`w-3.5 h-3.5 ${secondsRemaining <= 120 ? 'text-rose-400' : secondsRemaining <= 300 ? 'text-amber-400' : 'text-cyan-400'}`} />
+                <span>{formatTimeRemaining(secondsRemaining)} / 30:00</span>
+              </div>
+
+              {/* Live Session Status Indicator */}
+              <div className="flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium border backdrop-blur-md bg-white/5 border-white/10 text-zinc-300">
+                <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+                Session Active
               </div>
             </div>
 
             <Button 
               variant="outline" 
               size="sm" 
-              onClick={handleFinish}
-              disabled={isProcessing || isRecording || isEvaluating || !sessionId}
-              className="border-white/10 text-zinc-300 hover:bg-white/5 hover:text-white backdrop-blur-md transition-all rounded-full px-6"
+              onClick={handleConcludeClick}
+              disabled={isProcessing || isRecording || isEvaluating || isConcludingEarly || !sessionId}
+              className="border-white/10 text-zinc-300 hover:bg-white/5 hover:text-white backdrop-blur-md transition-all rounded-full px-6 cursor-pointer"
             >
-              {isEvaluating ? <Loader2 className="w-4 h-4 animate-spin" /> : "Conclude Session"}
+              {isEvaluating || isConcludingEarly ? <Loader2 className="w-4 h-4 animate-spin" /> : "Conclude Session"}
             </Button>
           </header>
 
           {/* Chat Area */}
-          <main className="flex-1 overflow-y-auto px-4 py-8 md:px-0 scroll-smooth z-10 w-full max-w-3xl mx-auto space-y-6">
+          <main className="flex-1 overflow-y-auto px-4 py-6 md:px-8 scroll-smooth z-10 w-full max-w-5xl mx-auto space-y-6">
             <AnimatePresence initial={false}>
               {messages.length === 0 && (
                 <motion.div
@@ -1189,7 +2050,44 @@ export default function InterviewPage() {
                       : "bg-gradient-to-tr from-cyan-600 to-cyan-500 border-cyan-400/20 text-white rounded-tr-sm shadow-[0_4px_25px_rgba(34,211,238,0.25)]"
                     }`}
                   >
-                    {msg.content}
+                    {msg.content.includes('```') ? (
+                      <div className="space-y-2">
+                        {msg.content.split('```').map((part, index) => {
+                          if (index % 2 === 1) {
+                            const lines = part.trim().split('\n');
+                            const lang = lines[0].match(/^[a-z0-9_-]+/i) ? lines[0] : '';
+                            const codeText = lang ? lines.slice(1).join('\n') : part;
+                            return (
+                              <div key={index} className="rounded-xl overflow-hidden bg-black/80 border border-cyan-500/30 my-2 font-mono text-xs shadow-inner">
+                                {lang && (
+                                  <div className="px-3 py-1 bg-white/5 border-b border-white/5 text-[10px] text-cyan-400 uppercase tracking-wider font-semibold">
+                                    {lang}
+                                  </div>
+                                )}
+                                <pre className="p-3.5 overflow-x-auto text-emerald-300 leading-relaxed font-mono whitespace-pre-wrap">
+                                  <code>{codeText}</code>
+                                </pre>
+                              </div>
+                            );
+                          }
+                          return <p key={index} className="whitespace-pre-wrap">{part}</p>;
+                        })}
+                      </div>
+                    ) : (
+                      <div>{msg.content}</div>
+                    )}
+                    {msg.role === "assistant" && (
+                      <div className="flex items-center justify-between mt-3 pt-2.5 border-t border-white/10 text-xs">
+                        <button
+                          type="button"
+                          onClick={() => kokoroTTS.speakQuestion(msg.content, () => startSilenceStopwatch())}
+                          className="inline-flex items-center gap-1.5 text-xs text-teal-400 hover:text-teal-300 font-medium transition-all cursor-pointer"
+                        >
+                          <Volume2 className="w-3.5 h-3.5 text-teal-400" />
+                          <span>{kokoroTTS.isPlaying && kokoroTTS.lastSpokenText === msg.content ? "Speaking Question..." : "🔊 Speak Question"}</span>
+                        </button>
+                      </div>
+                    )}
                   </div>
                 </motion.div>
               ))}
@@ -1206,12 +2104,132 @@ export default function InterviewPage() {
                   </div>
                 </motion.div>
               )}
+
+              {/* Interactive Live Coding Challenge Panel */}
+              {activeCodeChallenge && (
+                <motion.div
+                  initial={{ opacity: 0, scale: 0.97, y: 15 }}
+                  animate={{ opacity: 1, scale: 1, y: 0 }}
+                  className="w-full rounded-3xl p-6 bg-zinc-950/95 border border-cyan-500/40 shadow-[0_0_50px_rgba(6,182,212,0.25)] backdrop-blur-2xl space-y-4"
+                >
+                  {/* Header */}
+                  <div className="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-white/10">
+                    <div className="flex items-center gap-3">
+                      <div className="w-9 h-9 rounded-xl bg-cyan-500/20 border border-cyan-500/40 flex items-center justify-center text-cyan-400 shadow-[0_0_15px_rgba(34,211,238,0.3)]">
+                        <Code2 className="w-5 h-5" />
+                      </div>
+                      <div>
+                        <div className="flex items-center gap-2">
+                          <h3 className="text-base font-bold text-white tracking-wide">{activeCodeChallenge.title}</h3>
+                          <span className="text-[10px] uppercase font-mono px-2.5 py-0.5 rounded-full bg-cyan-500/20 text-cyan-300 border border-cyan-500/40">
+                            {activeCodeChallenge.language}
+                          </span>
+                        </div>
+                        <p className="text-xs text-zinc-400 font-mono mt-0.5">
+                          Repository Anchor: <span className="text-cyan-300 font-semibold">{activeCodeChallenge.repoName}</span>
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setCodeSolution(activeCodeChallenge.starterCode)}
+                        className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-white/5 hover:bg-white/10 text-zinc-400 hover:text-white text-xs font-mono transition-all cursor-pointer border border-white/5"
+                        title="Reset code to starter template"
+                      >
+                        <RotateCcw className="w-3.5 h-3.5" />
+                        <span>Reset</span>
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Description & Expected Behavior */}
+                  <div className="p-4 rounded-2xl bg-black/50 border border-white/5 text-xs text-zinc-300 space-y-2 font-sans leading-relaxed">
+                    <p className="text-zinc-200 text-sm">{activeCodeChallenge.description}</p>
+                    <p className="text-[11px] text-zinc-400 font-mono pt-1 border-t border-white/5">
+                      <strong className="text-cyan-400">Expected:</strong> {activeCodeChallenge.expectedBehavior}
+                    </p>
+                  </div>
+
+                  {/* Live Code Area */}
+                  <div className="relative rounded-2xl overflow-hidden border border-white/10 bg-[#0d1117] shadow-2xl">
+                    <div className="px-4 py-2 bg-black/60 border-b border-white/5 flex justify-between items-center text-[11px] font-mono text-zinc-400">
+                      <span className="flex items-center gap-2">
+                        <Terminal className="w-3.5 h-3.5 text-cyan-400" />
+                        <span>solution.{activeCodeChallenge.language === 'python' ? 'py' : 'ts'}</span>
+                      </span>
+                      <div className="flex items-center gap-3">
+                        <span className="text-zinc-500 text-[10px]">Tab key indented</span>
+                      </div>
+                    </div>
+
+                    <textarea
+                      value={codeSolution}
+                      onChange={(e) => setCodeSolution(e.target.value)}
+                      onPaste={(e) => {
+                        const pasted = e.clipboardData.getData('text');
+                        handleCodePaste(pasted);
+                      }}
+                      onKeyDown={(e) => {
+                        recordKeystroke();
+                        if (e.key === 'Tab') {
+                          e.preventDefault();
+                          const target = e.target as HTMLTextAreaElement;
+                          const start = target.selectionStart;
+                          const end = target.selectionEnd;
+                          const val = target.value;
+                          const updated = val.substring(0, start) + '  ' + val.substring(end);
+                          setCodeSolution(updated);
+                          setTimeout(() => {
+                            target.selectionStart = target.selectionEnd = start + 2;
+                          }, 0);
+                        }
+                      }}
+                      rows={9}
+                      placeholder="Type your implementation here..."
+                      className="w-full bg-transparent p-4 font-mono text-xs md:text-sm text-cyan-200 outline-none resize-none leading-relaxed selection:bg-cyan-500/30"
+                      spellCheck={false}
+                    />
+                  </div>
+
+                  {/* Action footer */}
+                  <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
+                    <span className="text-[11px] text-zinc-400 font-mono">
+                      Authentic Authorship Check • Real-Time Technical Evaluation
+                    </span>
+                    <Button
+                      onClick={handleSubmitCodeSolution}
+                      disabled={isSubmittingCode || !codeSolution.trim()}
+                      className="px-6 py-2.5 bg-gradient-to-r from-emerald-500 via-teal-500 to-cyan-500 hover:opacity-95 text-white font-semibold text-xs rounded-xl shadow-[0_0_25px_rgba(16,185,129,0.35)] cursor-pointer"
+                    >
+                      {isSubmittingCode ? (
+                        <span className="flex items-center gap-2">
+                          <Loader2 className="w-4 h-4 animate-spin" /> Evaluating Code...
+                        </span>
+                      ) : (
+                        <span className="flex items-center gap-2">
+                          <CheckCircle2 className="w-4 h-4" /> Submit Code Implementation
+                        </span>
+                      )}
+                    </Button>
+                  </div>
+                </motion.div>
+              )}
             </AnimatePresence>
             <div ref={messagesEndRef} />
           </main>
 
           {/* Interactive Controls (Mic) */}
-          <div className="relative w-full pb-8 pt-4 flex justify-center items-center z-10 bg-gradient-to-t from-black via-black/80 to-transparent">
+          {/* Interactive Controls (Mic & Post-TTS Latency Stopwatch) */}
+          <div className="relative w-full pb-8 pt-4 flex flex-col justify-center items-center z-10 bg-gradient-to-t from-black via-black/80 to-transparent">
+            {/* Live post-TTS latency measured silently in background */}
+            {isRecording && (
+              <div className="mb-3 flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-red-500/10 border border-red-500/30 text-red-300 text-xs font-mono shadow-[0_0_20px_rgba(239,68,68,0.2)]">
+                <span className="w-2 h-2 rounded-full bg-red-500 animate-ping" />
+                <span>Recording your answer... (Click mic when done)</span>
+              </div>
+            )}
             <button
               onClick={handleRecordToggle}
               disabled={isProcessing}
@@ -1260,6 +2278,50 @@ export default function InterviewPage() {
         </>
       )}
 
+      {/* Early Conclusion Confirmation Modal */}
+      <AnimatePresence>
+        {showConcludeEarlyModal && (
+          <motion.div 
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-[150] flex items-center justify-center p-4 bg-black/85 backdrop-blur-md"
+          >
+            <motion.div 
+              initial={{ scale: 0.95, y: 15 }}
+              animate={{ scale: 1, y: 0 }}
+              exit={{ scale: 0.95, y: 15 }}
+              className="bg-zinc-950 border border-rose-500/40 w-full max-w-md rounded-3xl p-6 shadow-2xl flex flex-col gap-5 text-center"
+            >
+              <div className="w-14 h-14 mx-auto rounded-2xl bg-rose-500/10 border border-rose-500/30 flex items-center justify-center text-rose-400 shadow-[0_0_20px_rgba(244,63,94,0.2)]">
+                <AlertCircle className="w-7 h-7" />
+              </div>
+              <div className="space-y-2">
+                <h3 className="text-lg font-bold text-white">Conclude Interview Early?</h3>
+                <p className="text-xs text-zinc-400 leading-relaxed">
+                  You are concluding before answering all questions. If you proceed, this session will end immediately, your application will be marked as <span className="text-rose-400 font-semibold">Rejected</span>, and you will not be able to retake this test.
+                </p>
+              </div>
+              <div className="flex items-center gap-3 pt-2">
+                <Button
+                  variant="outline"
+                  onClick={() => setShowConcludeEarlyModal(false)}
+                  className="flex-1 py-3 border-white/10 text-zinc-300 hover:bg-white/5 rounded-xl cursor-pointer text-xs"
+                >
+                  Continue Interview
+                </Button>
+                <Button
+                  onClick={handleConfirmConcludeEarly}
+                  className="flex-1 py-3 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded-xl shadow-[0_0_20px_rgba(225,29,72,0.4)] cursor-pointer text-xs"
+                >
+                  End & Reject
+                </Button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
       {/* Feedback Modal Overlay */}
       <AnimatePresence>
         {showFeedbackModal && (
@@ -1306,145 +2368,71 @@ export default function InterviewPage() {
           </motion.div>
         )}
       </AnimatePresence>
-      {/* REAL-TIME ML DEBUG PANEL (HUD) */}
-      <div className="fixed bottom-4 left-4 z-50 font-mono text-[11px] select-none">
-        {showDebugPanel ? (
-          <div className="bg-black/90 border border-cyan-500/30 backdrop-blur-2xl rounded-2xl p-4 shadow-[0_0_40px_rgba(0,0,0,0.85)] text-zinc-300 w-80 space-y-3">
-            <div className="flex items-center justify-between border-b border-white/10 pb-2">
-              <div className="flex items-center gap-2 text-cyan-400 font-bold tracking-wider uppercase text-xs">
-                <span className="w-2 h-2 rounded-full bg-cyan-400 animate-pulse" />
-                ML Performance Dashboard
-              </div>
-              <button 
-                onClick={() => setShowDebugPanel(false)} 
-                className="text-zinc-500 hover:text-white text-xs px-1.5 py-0.5 rounded bg-zinc-800 transition-all cursor-pointer"
-              >
-                ✕
-              </button>
-            </div>
 
-            {/* Performance Stats */}
-            <div className="space-y-1 text-[10px]">
-              <div className="flex justify-between">
-                <span className="text-zinc-500">Camera FPS:</span>
-                <span className="text-emerald-400 font-bold">{cameraFps} FPS</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-zinc-500">Inference Rate:</span>
-                <span className="text-cyan-300 font-bold">{inferenceFps} FPS</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-zinc-500">Frame Size:</span>
-                <span>640x360</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-zinc-500">Encode Time:</span>
-                <span>{encodeTime} ms</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-zinc-500">Network Latency:</span>
-                <span>{networkTime} ms</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-zinc-500">Decode Time:</span>
-                <span>{decodeTime} ms</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-zinc-500">Face Inference:</span>
-                <span className="text-emerald-300 font-bold">{faceInferenceTime} ms</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-zinc-500">Object Inference:</span>
-                <span className="text-cyan-300 font-bold">{objectInferenceTime} ms</span>
-              </div>
-              <div className="flex justify-between font-bold text-cyan-400">
-                <span>End-to-End Latency:</span>
-                <span>{totalEndToEndTime} ms</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-zinc-500">Pending Frames:</span>
-                <span className={pendingFramesCount > 0 ? "text-amber-400 font-bold" : "text-zinc-400"}>{pendingFramesCount}</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-zinc-500">Dropped Frames:</span>
-                <span className="text-zinc-400">{droppedFramesCount}</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-zinc-500">Heap Memory:</span>
-                <span>{memoryUsage > 0 ? `${memoryUsage} MB` : "N/A"}</span>
-              </div>
-            </div>
-
-            {/* Face Status */}
-            <div className="border-t border-white/10 pt-2 space-y-1 text-[10px]">
-              <div className="text-zinc-400 font-bold uppercase text-[9px] tracking-wider text-emerald-400">FACE TRACKING</div>
-              <div className="flex justify-between">
-                <span className="text-zinc-500">Detections:</span>
-                <span className="font-bold">{detectedFaceCount} (Conf: {(faceConfidence * 100).toFixed(0)}%)</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-zinc-500">State:</span>
-                <span className={`font-bold px-1.5 py-0.5 rounded text-[9px] tracking-wider ${
-                  faceState === 'PRESENT' ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30' :
-                  faceState === 'ABSENCE_CANDIDATE' ? 'bg-amber-500/20 text-amber-400 border border-amber-500/30' :
-                  'bg-rose-500/20 text-rose-400 border border-rose-500/30 animate-pulse'
-                }`}>
-                  {faceState}
-                </span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-zinc-500">Frames (+ / -):</span>
-                <span>+{consecutivePositiveFaces.current} / -{consecutiveMissedFaces.current}</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-zinc-500">Absence Timer:</span>
-                <span className={absenceTimerDisplay > 0 ? "text-rose-400 font-bold animate-pulse" : "text-zinc-400"}>
-                  {absenceTimerDisplay.toFixed(1)}s / 3.0s
-                </span>
-              </div>
-            </div>
-
-            {/* Objects Status */}
-            <div className="border-t border-white/10 pt-2 space-y-1 text-[10px]">
-              <div className="text-zinc-400 font-bold uppercase text-[9px] tracking-wider text-cyan-400">OBJECTS & DEVICES</div>
-              <div className="flex justify-between">
-                <span className="text-zinc-500">Detected:</span>
-                <span className="font-mono truncate max-w-[150px]">
-                  {detectedObjectsList.length > 0 
-                    ? detectedObjectsList.map(o => `${o.class} (${(o.confidence * 100).toFixed(0)}%)`).join(', ')
-                    : 'None'}
-                </span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-zinc-500">Device State:</span>
-                <span className={`font-bold ${
-                  objectState === 'VIOLATION_REPORTED' ? 'text-rose-400 animate-pulse' :
-                  objectState === 'CONFIRMED' ? 'text-rose-400' :
-                  objectState === 'CANDIDATE' ? 'text-amber-400' : 'text-emerald-400'
-                }`}>
-                  {objectState}
-                </span>
-              </div>
-            </div>
-
-            {/* WebSocket Status */}
-            <div className="border-t border-white/10 pt-2 flex justify-between text-[9px]">
-              <span className="text-zinc-500">WebSocket Transport:</span>
-              <span className={socketStatus === 'CONNECTED' ? "text-emerald-400 font-bold" : "text-amber-400"}>
-                {socketStatus}
-              </span>
-            </div>
-          </div>
-        ) : (
-          <button
-            onClick={() => setShowDebugPanel(true)}
-            className="bg-black/80 border border-white/10 backdrop-blur-md px-3 py-1.5 rounded-full text-zinc-300 hover:text-white flex items-center gap-1.5 shadow-xl hover:border-cyan-400 transition-all text-xs cursor-pointer"
+      {/* Candidate Completion Screen (Clean, Professional, No Scores or Telemetry Shown) */}
+      {isInterviewCompleted && (
+        <div className="absolute inset-0 z-[120] flex flex-col items-center justify-center bg-black p-6 text-center">
+          <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_center,_var(--tw-gradient-stops))] from-cyan-950/20 via-black to-black pointer-events-none" />
+          
+          <motion.div
+            initial={{ opacity: 0, scale: 0.95 }}
+            animate={{ opacity: 1, scale: 1 }}
+            transition={{ duration: 0.5, ease: "easeOut" }}
+            className="z-10 max-w-lg w-full bg-zinc-900/90 border border-white/10 rounded-3xl p-8 md:p-10 shadow-2xl backdrop-blur-xl flex flex-col items-center gap-6"
           >
-            <span className="w-2 h-2 rounded-full bg-cyan-400 animate-pulse" />
-            Show ML Debug HUD
-          </button>
-        )}
-      </div>
+            <div className="w-20 h-20 rounded-full bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center shadow-[0_0_30px_rgba(16,185,129,0.2)]">
+              <CheckCircle2 className="w-10 h-10 text-emerald-400" />
+            </div>
+
+            <div className="space-y-2">
+              <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 text-xs font-semibold uppercase tracking-wider mb-1">
+                Assessment Completed
+              </div>
+              <h1 className="text-2xl md:text-3xl font-bold text-white tracking-tight">
+                {isDemo ? "Demo Interview Complete!" : "Thank You for Taking the Exam!"}
+              </h1>
+              <p className="text-zinc-400 text-sm leading-relaxed">
+                {isDemo 
+                  ? "Your 10-question demo assessment has been completed and fully evaluated with proctoring telemetry." 
+                  : "Your interview session and technical responses have been securely recorded and submitted to MANAKIN.AI."}
+              </p>
+            </div>
+
+            <div className="w-full p-4 rounded-2xl bg-black/60 border border-white/5 text-left text-xs text-zinc-400 space-y-2">
+              <div className="flex items-center gap-2 text-zinc-300 font-medium">
+                <ShieldCheck className="w-4 h-4 text-cyan-400 shrink-0" />
+                <span>Session Securely Saved & Evaluated</span>
+              </div>
+              <p className="text-zinc-500 leading-normal pl-6">
+                Your responses and proctoring verification have been securely recorded and submitted to the hiring team.
+              </p>
+            </div>
+
+            <div className="pt-2 w-full flex flex-col gap-3">
+              {isDemo && user?.role === 'RECRUITER' && (
+                <Button
+                  onClick={() => router.push(`/evaluation?sessionId=${sessionId}&isDemo=true`)}
+                  className="w-full py-5 text-sm font-semibold rounded-2xl bg-gradient-to-r from-cyan-600 via-indigo-600 to-violet-600 hover:opacity-95 text-white transition-all shadow-[0_0_25px_rgba(34,211,238,0.25)] flex items-center justify-center gap-2 cursor-pointer"
+                >
+                  <Sparkles className="w-4 h-4" />
+                  <span>View Evaluation & Proctoring Report</span>
+                  <ArrowRight className="w-4 h-4" />
+                </Button>
+              )}
+              <Button
+                onClick={() => router.push("/")}
+                className="w-full py-5 text-sm font-semibold rounded-2xl bg-zinc-800 hover:bg-zinc-700 text-white border border-white/10 transition-all shadow-lg cursor-pointer"
+              >
+                Close Session & Return to Home
+              </Button>
+            </div>
+
+            <p className="text-[11px] text-zinc-600">
+              You may now safely close this browser window or tab.
+            </p>
+          </motion.div>
+        </div>
+      )}
     </div>
   );
 }

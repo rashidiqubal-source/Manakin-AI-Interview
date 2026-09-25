@@ -1,5 +1,7 @@
 # Applicant Resume Intelligence & Evidence Preservation Specification
 
+> 📖 **Related Deep-Dive Document**: [Smart Resume Intelligence Pipeline Specification](./resume-intelligence.md)
+
 ## 1. Overview
 
 The **Resume Intelligence Pipeline** accepts an applicant's uploaded PDF resume, extracts raw text with layout awareness, applies deterministic rule-based extractions, and runs an AI-powered extraction pipeline to produce a **Canonical Normalized Resume**.

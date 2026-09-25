@@ -14,9 +14,12 @@ const router = Router();
 router.post('/start', validate(startInterviewSchema), InterviewController.start);
 router.post('/respond', validate(respondInterviewSchema), InterviewController.respond);
 router.post('/evaluate', validate(evaluateInterviewSchema), InterviewController.evaluate);
+router.post('/conclude-early', InterviewController.concludeEarly);
 router.post('/feedback', validate(submitFeedbackSchema), InterviewController.submitFeedback);
 router.post('/proctor/frame', validate(proctorFrameSchema), InterviewController.proctorFrame);
+router.post('/tts', InterviewController.generateTTS);
 router.post('/questions/generate', InterviewController.generateQuestions);
 router.get('/candidate/sessions/:email', InterviewController.getSessionsByEmail);
+router.get('/session/:id/explainable-report', InterviewController.getExplainableReport);
 
 export default router;

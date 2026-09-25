@@ -4,7 +4,7 @@ import { useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { motion } from "framer-motion";
-import { Mic, ArrowRight, Shield } from "lucide-react";
+import { Mic, ArrowRight, Shield, Play } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { toast } from "sonner";
@@ -67,24 +67,23 @@ export default function LandingPage() {
             <div className="w-full space-y-4 pt-2">
               {isInitialized && !user && (
                 <div className="w-full space-y-4">
-                  <p className="text-xs text-center text-zinc-400">Choose your entry portal to proceed:</p>
+                  {/* Recruiter Flow Button */}
+                  <Link href="/recruiter/sign-in" className="block w-full">
+                    <Button variant="outline" className="w-full py-5 border-zinc-700 bg-zinc-900/60 hover:bg-zinc-800 text-zinc-200 font-semibold text-sm rounded-2xl transition-all flex items-center justify-center gap-2 cursor-pointer">
+                      <span>Enter Recruiter Portal</span>
+                      <ArrowRight className="w-4 h-4" />
+                    </Button>
+                  </Link>
 
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                    {/* Recruiter Flow Button */}
-                    <Link href="/recruiter/sign-in" className="block w-full">
-                      <Button className="w-full h-24 bg-gradient-to-b from-violet-500/10 to-zinc-900 hover:from-violet-500/20 border border-violet-500/30 text-violet-300 font-semibold rounded-2xl transition-all flex flex-col items-center justify-center gap-1.5 shadow-[0_0_20px_rgba(139,92,246,0.1)]">
-                        <span className="text-base font-bold text-white">Recruiter Portal</span>
-                        <span className="text-[11px] text-zinc-400 font-normal">Upload JDs & Invite Applicants</span>
-                      </Button>
-                    </Link>
-
-                    {/* Applicant Flow Button */}
-                    <Link href="/applicant/sign-in" className="block w-full">
-                      <Button className="w-full h-24 bg-gradient-to-b from-teal-500/10 to-zinc-900 hover:from-teal-500/20 border border-teal-500/30 text-teal-300 font-semibold rounded-2xl transition-all flex flex-col items-center justify-center gap-1.5 shadow-[0_0_20px_rgba(13,148,136,0.1)]">
-                        <span className="text-base font-bold text-white">Applicant Portal</span>
-                        <span className="text-[11px] text-zinc-400 font-normal">Upload Resume & Take Interview</span>
-                      </Button>
-                    </Link>
+                  {/* Candidate Invitation-Only Notice */}
+                  <div className="p-4 rounded-2xl bg-zinc-900/60 border border-white/10 text-left space-y-1.5 backdrop-blur-md">
+                    <div className="flex items-center gap-2 text-cyan-400 font-semibold text-xs uppercase tracking-wider">
+                      <Shield className="w-4 h-4" />
+                      <span>Official Job Interviews: Invitation Only</span>
+                    </div>
+                    <p className="text-xs text-zinc-400 leading-relaxed">
+                      Official candidate assessments require an invitation link sent to your email. Recruiters can sign in above to manage job descriptions, invite candidates, and run demo interviews.
+                    </p>
                   </div>
                 </div>
               )}
@@ -97,44 +96,34 @@ export default function LandingPage() {
                 >
                   <div className="flex items-center justify-between border border-zinc-800 rounded-xl p-3 bg-zinc-900/50 backdrop-blur-md">
                     <span className="text-white text-xs">
-                      Signed in as <span className="font-bold text-teal-300">{user.name || user.email.split("@")[0]}</span> ({user.role})
+                      Signed in as <span className="font-bold text-violet-300">{user.name || user.email.split("@")[0]}</span> ({user.role})
                     </span>
                     <UserMenu />
                   </div>
 
-                  {user.role === "RECRUITER" ? (
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                      <Link href="/recruiter" className="block w-full">
-                        <Button className="w-full h-24 bg-violet-600/20 hover:bg-violet-600/30 border border-violet-500/40 text-violet-300 font-semibold rounded-2xl transition-all flex flex-col items-center justify-center gap-1.5 shadow-[0_0_20px_rgba(139,92,246,0.15)]">
-                          <span className="text-base font-bold text-white">Recruiter Dashboard</span>
-                          <span className="text-[11px] text-zinc-400">Manage JDs & Candidate Invites</span>
-                        </Button>
-                      </Link>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <Link href="/recruiter" className="block w-full">
+                      <Button className="w-full h-24 bg-violet-600/20 hover:bg-violet-600/30 border border-violet-500/40 text-violet-300 font-semibold rounded-2xl transition-all flex flex-col items-center justify-center gap-1.5 shadow-[0_0_20px_rgba(139,92,246,0.15)] cursor-pointer">
+                        <span className="text-base font-bold text-white">Recruiter Dashboard</span>
+                        <span className="text-[11px] text-zinc-400">Manage JDs & Candidate Invites</span>
+                      </Button>
+                    </Link>
 
-                      <Link href="/admin" className="block w-full">
-                        <Button className="w-full h-24 bg-yellow-500/10 hover:bg-yellow-500/20 border border-yellow-500/30 text-yellow-300 font-semibold rounded-2xl transition-all flex flex-col items-center justify-center gap-1.5 shadow-[0_0_20px_rgba(234,179,8,0.1)]">
-                          <span className="text-base font-bold text-white">Candidate Analytics</span>
-                          <span className="text-[11px] text-zinc-400">View Applicant Pipeline & Scores</span>
-                        </Button>
-                      </Link>
-                    </div>
-                  ) : (
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                      <Link href="/applicant/dashboard" className="block w-full">
-                        <Button className="w-full h-24 bg-teal-600/20 hover:bg-teal-600/30 border border-teal-500/40 text-teal-300 font-semibold rounded-2xl transition-all flex flex-col items-center justify-center gap-1.5 shadow-[0_0_20px_rgba(20,184,166,0.15)]">
-                          <span className="text-base font-bold text-white">Applicant Dashboard</span>
-                          <span className="text-[11px] text-zinc-400">Upload Resume & Take Interview</span>
-                        </Button>
-                      </Link>
+                    <Link href="/admin" className="block w-full">
+                      <Button className="w-full h-24 bg-yellow-500/10 hover:bg-yellow-500/20 border border-yellow-500/30 text-yellow-300 font-semibold rounded-2xl transition-all flex flex-col items-center justify-center gap-1.5 shadow-[0_0_20px_rgba(234,179,8,0.1)] cursor-pointer">
+                        <span className="text-base font-bold text-white">Candidate Analytics</span>
+                        <span className="text-[11px] text-zinc-400">View Applicant Pipeline & Scores</span>
+                      </Button>
+                    </Link>
+                  </div>
 
-                      <Link href="/dashboard" className="block w-full">
-                        <Button className="w-full h-24 bg-cyan-600/20 hover:bg-cyan-600/30 border border-cyan-500/40 text-cyan-300 font-semibold rounded-2xl transition-all flex flex-col items-center justify-center gap-1.5 shadow-[0_0_20px_rgba(6,182,212,0.15)]">
-                          <span className="text-base font-bold text-white">Interview History</span>
-                          <span className="text-[11px] text-zinc-400">Track Evaluation Results</span>
-                        </Button>
-                      </Link>
-                    </div>
-                  )}
+                  {/* Quick Demo Access for Signed-In Recruiters/Admins */}
+                  <Link href="/demo" className="block w-full">
+                    <Button variant="outline" className="w-full py-4 border-cyan-800/40 bg-cyan-950/20 hover:bg-cyan-950/40 text-cyan-300 font-medium text-xs rounded-xl transition-all flex items-center justify-center gap-2 cursor-pointer">
+                      <Play className="w-4 h-4 fill-current" />
+                      <span>Test 10-Question Demo Interview (With Full Proctoring & Evidence)</span>
+                    </Button>
+                  </Link>
                 </motion.div>
               )}
 

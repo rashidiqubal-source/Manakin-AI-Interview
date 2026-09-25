@@ -134,6 +134,15 @@ model JobDescription {
   contentHash        String?
   analysisVersion    String?  @default("v2")
 
+  // JD Analysis Pipeline Fields
+  extractedMarkdown      String?  @db.Text
+  initialStructuredJD    Json?
+  clarificationQuestions Json?
+  recruiterAnswers       Json?
+  finalStructuredJD      Json?
+  confidence             Float?   @default(1.0)
+  processingStatus       String?  @default("UPLOADING")
+
   invitations  InterviewInvitation[]
 }
 
@@ -147,6 +156,7 @@ model ApplicantResume {
   aiAnalysis   Json?
 
   // Canonical Normalized Resume & Intelligence Fields
+  extractedMarkdown  String?  @db.Text
   normalizedResume   Json?
   contentHash        String?
   analysisVersion    String?  @default("v2")
@@ -169,9 +179,12 @@ model InterviewInvitation {
   applicant          User?            @relation("ApplicantInvitations", fields: [applicantId], references: [id], onDelete: SetNull)
   applicantResumeId  String?
   applicantResume    ApplicantResume? @relation(fields: [applicantResumeId], references: [id], onDelete: SetNull)
+  githubUrl          String?
   status             InvitationStatus @default(PENDING)
   interviewSessionId String?          @unique
   interviewSession   InterviewSession? @relation(fields: [interviewSessionId], references: [id], onDelete: SetNull)
+  exitCount          Int              @default(0)   // How many times candidate exited mid-interview
+  completedAt        DateTime?                       // Set when interview is fully completed (locks retake)
   createdAt          DateTime         @default(now())
   updatedAt          DateTime         @updatedAt
 }
@@ -193,6 +206,7 @@ model InterviewSession {
   id                    String            @id @default(uuid())
   candidateName         String
   candidateEmail        String?
+  githubUrl             String?
   applicationStatus     ApplicationStatus @default(PENDING)
   status                SessionStatus     @default(IN_PROGRESS)
   overallRecommendation String?
@@ -201,6 +215,24 @@ model InterviewSession {
   evaluationData        Json?
   questionBlueprint     Json?
   feedback              String?
+
+  // Evidence Intelligence Fields
+  evidenceGraph         Json?
+  evidenceGaps          Json?
+  verifiedClaims        Json?
+  contradictions        Json?
+  githubEvidence        Json?
+  aiFluency             Json?
+  evidenceReport        Json?
+
+  // Eye Tracking & Response Latency Intelligence
+  eyeTrackingData       Json?
+  responseLatencies     Json?
+
+  // Multi-Signal Evidence-Based Proctoring Intelligence
+  proctoringSummary     Json?
+  proctoringTimeline    Json?
+
   createdAt             DateTime          @default(now())
   updatedAt             DateTime          @updatedAt
 
@@ -217,13 +249,15 @@ model Message {
   content            String
   createdAt          DateTime         @default(now())
 
-  // Per-question micro-evaluation scores for candidate answers
+  // Per-question technical micro-evaluation scores for candidate answers (1-10)
+  technicalAccuracy  Int?
+  technicalDepth     Int?
   clarity            Int?
-  warmth             Int?
-  simplicity         Int?
-  patience           Int?
-  fluency            Int?
-  engagement         Int?
+  problemSolving     Int?
+
+  // Audio & Response Latency metrics
+  silenceLatency     Float?
+  ttsDuration        Float?
 }
 
 enum SessionStatus {
@@ -247,9 +281,14 @@ model DetectionEvent {
   id                 String           @id @default(uuid())
   interviewSessionId String
   interviewSession   InterviewSession @relation(fields: [interviewSessionId], references: [id], onDelete: Cascade)
-  eventType          String           // "FACE_ABSENCE", "MULTIPLE_FACES", "UNAUTHORIZED_DEVICE", "SUSPICIOUS_OBJECT"
+  eventType          String           // "FACE_MISSING", "MULTIPLE_FACES", "UNAUTHORIZED_DEVICE", "HEAD_TURN", "GAZE_AWAY", "EYES_CLOSED", etc.
   objectClass        String?
   confidence         Float?
   riskLevel          String           // "HIGH", "MEDIUM", "LOW"
+  durationMs         Int?             // Duration of sustained signal in ms
+  source             String?          // Detection source: "YOLO26", "MEDIAPIPE_FACE_LANDMARKER", "BROWSER_VISIBILITY", "AUDIO_ANALYSER", "HEAD_POSE"
+  questionId         String?          // Correlated interview question ID/turn
+  answerId           String?          // Correlated candidate answer ID/turn
+  metadata           Json?            // Fine-grained sensor data (yaw/pitch/roll, EAR, etc.)
   timestamp          DateTime         @default(now())
 }

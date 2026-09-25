@@ -14,9 +14,6 @@ import { csrfProtection } from './middlewares/csrf';
 
 import mlRoutes from './ml/routes/mlRoutes';
 
-import swaggerUi from 'swagger-ui-express';
-import swaggerJsdoc from 'swagger-jsdoc';
-
 const app = express();
 
 // Trust the reverse proxy so rate limiting and secure cookies work accurately behind load balancers
@@ -68,8 +65,8 @@ app.use('/api/ml', mlRoutes);
 app.use('/api/v1/ml', mlRoutes);
 
 const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 100,
+  windowMs: 15 * 60 * 1000, 
+  max: 100, 
   message: 'Too many requests from this IP'
 });
 app.use('/api', limiter);
@@ -88,27 +85,6 @@ app.get('/health', (req, res) => {
 });
 
 app.use('/api/v1', apiV1Routes);
-
-const swaggerOptions = {
-  definition: {
-    openapi: '3.0.0',
-    info: {
-      title: 'AI Interview Platform API',
-      version: '1.0.0',
-      description: 'API Documentation for AI Interviewer Backend',
-    },
-    servers: [
-      {
-        url: 'http://localhost:3000/api/v1',
-        description: 'Development Server',
-      },
-    ],
-  },
-  apis: ['./src/routes/**/*.ts'],
-};
-
-const swaggerSpec = swaggerJsdoc(swaggerOptions);
-app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec));
 
 app.use((req, res) => {
   res.status(404).json({ success: false, message: 'Route Not Found' });

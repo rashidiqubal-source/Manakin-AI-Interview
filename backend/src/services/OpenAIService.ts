@@ -4,6 +4,7 @@ import { env } from '../config/env';
 import { logger } from '../config/logger';
 
 const OPENAI_API_KEY = env.OPENAI_API_KEY || process.env.OPENAI_API_KEY || '';
+const OPENAI_MODEL = process.env.OPENAI_MODEL || env.OPENAI_MODEL || 'gpt-4o-mini';
 const openai = new OpenAI({
   apiKey: OPENAI_API_KEY,
   timeout: 20000,
@@ -12,19 +13,27 @@ const openai = new OpenAI({
 
 export class OpenAIService {
   /**
-   * Translates an audio file using Whisper STT
+   * Transcribes an audio file using Whisper STT
    */
   static async transcribeAudio(filePath: string): Promise<string> {
     try {
-      const response = await openai.audio.translations.create({
+      if (!fs.existsSync(filePath)) {
+        return '';
+      }
+      const stats = fs.statSync(filePath);
+      if (stats.size < 500) {
+        logger.warn(`Audio file is too small (${stats.size} bytes), skipping Whisper call`);
+        return '';
+      }
+
+      const response = await openai.audio.transcriptions.create({
         file: fs.createReadStream(filePath),
         model: 'whisper-1',
-        response_format: 'text',
       });
-      return response as unknown as string;
-    } catch (error) {
-      logger.error(`OpenAI Transcription Error: ${error}`);
-      throw new Error('Failed to transcribe audio.');
+      return (typeof response === 'string' ? response : (response as any).text || '').trim();
+    } catch (error: any) {
+      logger.error(`OpenAI Transcription Error: ${error.message || error}`);
+      return '';
     }
   }
 
@@ -38,7 +47,7 @@ export class OpenAIService {
 
     try {
       const response = await openai.chat.completions.create({
-        model: 'gpt-4o-mini',
+        model: OPENAI_MODEL,
         messages: apiMessages,
         temperature: 0.7,
       });
@@ -50,129 +59,277 @@ export class OpenAIService {
   }
 
   /**
-   * Quick Micro-Evaluation of a Single Answer for Adaptive Cutoff
+   * Quick Micro-Evaluation of a Single Answer for Adaptive Cutoff and Technical Substance
    */
   static async evaluateSingleAnswer(questionText: string, userText: string): Promise<any> {
     const prompt = `
-      You are a strict but fair tutor evaluator. Score the candidate's single response (1-10) against the question asked.
+      You are a Principal Software Engineering Evaluator. Score the candidate's single response (1-10) against the technical question asked.
+      Do NOT evaluate on superficial confidence, generic warmth, or child-appropriate tutoring traits. Focus strictly on technical depth and accuracy.
 
       Question: "${questionText}"
       Candidate Answer: "${userText}"
 
-      Rubric (1=Poor, 10=Excellent):
-      - clarity: logical, well-structured, easy to follow.
-      - warmth: supportive, encouraging, empathetic tone.
-      - simplicity: child-appropriate language without jargon.
-      - patience: how well the answer shows support for a struggling student.
-      - fluency: natural, coherent English with good sentence flow.
-      - engagement: how well they keep the listener hooked (voice dynamics via text proxy).
+      Technical Rubric (1=Poor/Incompetent, 10=Exceptional Mastery):
+      - technicalAccuracy: exactness of technical facts, correct algorithmic concepts, correct API/framework/protocol usage.
+      - depth: architectural depth, understanding of underlying mechanics, trade-offs, concurrency, failure modes, edge cases.
+      - problemSolving: structured engineering logic, concrete troubleshooting steps, practical system trade-offs.
+      - technicalCommunication: clear, structured, precise technical articulation without hand-waving or fluff.
+      - claimVerification: if the question probed a claimed GitHub repository, project, or resume claim, did the candidate demonstrate genuine hands-on authorship and command? If unable to answer, evasive, or admitting unfamiliarity with their own claimed project, score 1-3.
 
-      Also determine the responseQuality. Valid options are: "clear", "vague", "complex", "off-topic", or "unsatisfactory".
-      CRITICAL RULE: If the user provides an answer that is completely different from what was asked, ignores the scenario entirely, or is structurally unsatisfactory, label it strictly as "unsatisfactory" or "off-topic". 
+      Also determine responseQuality: "clear", "vague", "evasive", "off-topic", or "unsatisfactory".
+      CRITICAL RULE: If the user provides an answer that is completely different from what was asked, dodges the technical core, or is unable to explain their claimed project/technology, label it strictly as "unsatisfactory", "evasive", or "off-topic".
       If the response is extremely short (one-word) or silent, label it "vague" or "off-topic" accordingly.
 
-      Score fairly based only on this answer. Do not add extra commentary.
       Return ONLY a raw JSON object matching this exact schema (no markdown, no extra text):
       {
+        "technicalAccuracy": 8,
+        "depth": 8,
+        "problemSolving": 7,
+        "technicalCommunication": 8,
+        "claimVerification": 8,
         "clarity": 8,
-        "warmth": 9,
+        "warmth": 8,
         "simplicity": 7,
         "patience": 8,
-        "fluency": 9,
+        "fluency": 8,
         "engagement": 8,
-        "average": 8.1,
+        "average": 7.8,
         "responseQuality": "clear"
       }
     `;
 
     try {
       const response = await openai.chat.completions.create({
-        model: 'gpt-4o-mini',
+        model: OPENAI_MODEL,
         messages: [{ role: 'system', content: prompt }],
         temperature: 0.1,
       });
 
       const content = response.choices[0].message.content || '{}';
       const cleanContent = content.replace(/```json/g, '').replace(/```/g, '').trim();
-      return JSON.parse(cleanContent);
+      const parsed = JSON.parse(cleanContent);
+      
+      // Ensure backward-compatible aliases
+      parsed.clarity = parsed.technicalAccuracy ?? parsed.clarity ?? 5;
+      parsed.warmth = parsed.depth ?? parsed.warmth ?? 5;
+      parsed.simplicity = parsed.problemSolving ?? parsed.simplicity ?? 5;
+      parsed.patience = parsed.claimVerification ?? parsed.patience ?? 5;
+      parsed.fluency = parsed.technicalCommunication ?? parsed.fluency ?? 5;
+      parsed.engagement = parsed.claimVerification ?? parsed.engagement ?? 5;
+
+      return parsed;
     } catch (error) {
       logger.error(`Single Answer Eval Error: ${error}`);
-      return { clarity: 5, warmth: 5, simplicity: 5, patience: 5, fluency: 5, engagement: 5, average: 5.0, responseQuality: "clear" };
+      return {
+        technicalAccuracy: 5,
+        depth: 5,
+        problemSolving: 5,
+        technicalCommunication: 5,
+        claimVerification: 5,
+        clarity: 5,
+        warmth: 5,
+        simplicity: 5,
+        patience: 5,
+        fluency: 5,
+        engagement: 5,
+        average: 5.0,
+        responseQuality: "clear"
+      };
     }
   }
 
   /**
-   * JSON Structure Evaluator (Final Output)
+   * Evaluates Candidate Live Code Submission against Problem Statement & Claimed Repository Architecture
    */
-  static async evaluateInterview(messages: any[], userMessageCount?: number): Promise<any> {
-    const evaluationPrompt = `
-      You are an expert AI evaluator for tutor interviews. Review the following transcript.
-      
-      --------------------------------------------------
-      📊 EVALUATION
-      --------------------------------------------------
-      Provide a structured JSON output evaluating the candidate strictly on:
-      - clarity (1-10 scale rating, plus detailed reasoning)
-      - warmth (1-10)
-      - patience (1-10)
-      - simplicity (1-10)
-      - fluency (1-10)
-      - engagement (1-10 scale rating based on pacing and hooks)
-      
-      Additionally, include robust metadata:
-      - overallRecommendation ("PASS" or "FAIL")
-      - evidenceQuotes (array of at least 3 verbatim strings from the candidate)
-      - teachingStyle (string: 'example-driven', 'structured', 'unclear', 'authoritative', etc)
-      - riskFlags (array of strings, e.g., ["impatience", "vague", "jargon-heavy", "negative tone"])
-      - keyHighlights (array of strings praising specific good things they did)
-      - consistencyAnalysis (string summarizing if they improved or contradicted Governments/themselves)
-      - communicationStyleAnalysis (object with fields: structure (string), examplesUsed (boolean), stepByStep (boolean))
+  static async evaluateCodeSubmission(
+    challenge: any,
+    code: string,
+    language: string = 'typescript',
+    repoName: string = 'claimed repository'
+  ): Promise<any> {
+    const prompt = `
+      You are a Principal Software Engineer and Technical Hiring Evaluator.
+      Evaluate the candidate's code submission for the challenge: "${challenge.title || challenge.functionName || 'Code Implementation'}".
+      Repository Context: Candidate claims ownership of repository "${repoName}".
+      Problem Description: "${challenge.description || ''}"
+      Expected Behavior: "${challenge.expectedBehavior || ''}"
 
-      --------------------------------------------------
-      📏 SCORING GUIDELINES
-      --------------------------------------------------
-      10 = Excellent (clear, child-friendly, empathetic, fluent)
-      8 = Good (minor issues)
-      6 = Average (some clarity but inconsistent)
-      4 = Weak (struggles to communicate)
-      1-2 = Poor (not suitable for tutoring)
+      Candidate Code (${language}):
+      \`\`\`${language}
+      ${code}
+      \`\`\`
 
-      IMPORTANT RULES ABOUT INTERVIEW LENGTH:
-      - A complete interview consists of exactly 10 candidate responses.
-      - The candidate provided exactly ${userMessageCount ?? 'an unknown number of'} responses in this transcript.
-      - EARLY TERMINATION PENALTY: If the candidate answered 5 or fewer questions, you MUST heavily penalize ALL of their scores (maximum score of 4 for any category) and set overallRecommendation to "FAIL". Leaving an interview early or failing out early is an automatic failure, regardless of how good their few answers were.
-      - If they answered 6-9 questions, apply a moderate penalty across all scores and add "Incomplete Interview" to riskFlags.
+      Technical Rubric (1=Poor/Broken, 10=Production-Grade Mastery):
+      - technicalAccuracy: functional correctness, syntax correctness, meets expected function signature and return type.
+      - depth: algorithmic efficiency (O(N) or O(1)), proper cryptographic/hashing libraries or string manipulation.
+      - problemSolving: edge-case resilience (handles empty strings, null/undefined, boundaries).
+      - codeQuality: clean code, idiomatic syntax, formatting, naming conventions, absence of anti-patterns.
+      - claimVerification: does this code corroborate genuine, authentic authorship and familiarity with the domain claimed in repository "${repoName}"?
 
-      OTHER IMPORTANT RULES:
-      - Use actual quotes from candidate responses in \`evidenceQuotes\`
-      - Identify subtle "risk flags" like long monologues or skipping steps
-      - Be fair, not overly harsh (unless the early termination penalty applies)
+      Also determine:
+      - correctness: "CORRECT" | "PARTIALLY_CORRECT" | "INCORRECT"
+      - feedback: 1-2 sentence engineering feedback summarizing quality and edge cases.
+      - followUpPoints: Array of 2 technical observations to probe in oral follow-ups (e.g., salt entropy, collisions, null handling, integration).
 
-      Return ONLY valid JSON in exactly this root-level schema shape (do NOT nest score/reasoning inside sub-objects arbitrarily, output exactly this):
+      Return ONLY a raw JSON object matching this exact schema (no markdown, no extra text):
       {
-        "clarity": { "score": 8, "reasoning": "..." },
-        "simplicity": { "score": 7, "reasoning": "..." },
-        "patience": { "score": 9, "reasoning": "..." },
-        "warmth": { "score": 10, "reasoning": "..." },
-        "fluency": { "score": 8, "reasoning": "..." },
-        "engagement": { "score": 8, "reasoning": "..." },
-        "overallRecommendation": "PASS",
-        "evidenceQuotes": ["Quote 1 here", "Quote 2 here", "Quote 3 here"],
-        "teachingStyle": "example-driven",
-        "riskFlags": ["none"],
-        "keyHighlights": ["Used excellent pizza analogy"],
-        "consistencyAnalysis": "Candidate consistently maintained a warm tone...",
-        "communicationStyleAnalysis": {
-           "structure": "excellent, highly logical",
-           "examplesUsed": true,
-           "stepByStep": true
-        }
+        "technicalAccuracy": 8,
+        "depth": 8,
+        "problemSolving": 7,
+        "codeQuality": 8,
+        "claimVerification": 8,
+        "clarity": 8,
+        "warmth": 8,
+        "simplicity": 7,
+        "patience": 8,
+        "fluency": 8,
+        "engagement": 8,
+        "average": 7.8,
+        "correctness": "CORRECT",
+        "feedback": "Clean implementation with solid salt concatenation.",
+        "followUpPoints": ["Algorithmic trade-offs and collision resistance", "Edge cases with empty salt"]
       }
     `;
 
     try {
       const response = await openai.chat.completions.create({
-        model: 'gpt-4o-mini',
+        model: OPENAI_MODEL,
+        messages: [{ role: 'system', content: prompt }],
+        temperature: 0.1,
+      });
+
+      const content = response.choices[0].message.content || '{}';
+      const cleanContent = content.replace(/```json/g, '').replace(/```/g, '').trim();
+      const parsed = JSON.parse(cleanContent);
+
+      parsed.clarity = parsed.technicalAccuracy ?? parsed.clarity ?? 5;
+      parsed.warmth = parsed.depth ?? parsed.warmth ?? 5;
+      parsed.simplicity = parsed.problemSolving ?? parsed.simplicity ?? 5;
+      parsed.patience = parsed.claimVerification ?? parsed.patience ?? 5;
+      parsed.fluency = parsed.codeQuality ?? parsed.fluency ?? 5;
+      parsed.engagement = parsed.claimVerification ?? parsed.engagement ?? 5;
+
+      return parsed;
+    } catch (error) {
+      logger.error(`Code Submission Eval Error: ${error}`);
+      return {
+        technicalAccuracy: 5,
+        depth: 5,
+        problemSolving: 5,
+        codeQuality: 5,
+        claimVerification: 5,
+        clarity: 5,
+        warmth: 5,
+        simplicity: 5,
+        patience: 5,
+        fluency: 5,
+        engagement: 5,
+        average: 5.0,
+        correctness: "PARTIALLY_CORRECT",
+        feedback: "Code submitted and recorded.",
+        followUpPoints: ["Input validation edge cases", "Production integration in repository"]
+      };
+    }
+  }
+
+  /**
+   * JSON Structure Evaluator (Final Output) - Technical Engineering Rigor & GitHub Verification
+   */
+  static async evaluateInterview(
+    messages: any[],
+    userMessageCount?: number,
+    context?: { githubEvidence?: any; contradictions?: any[]; jobTitle?: string }
+  ): Promise<any> {
+    const githubContextStr = context?.githubEvidence ? JSON.stringify(context.githubEvidence, null, 2) : 'No public GitHub profile analyzed.';
+    const contradictionsStr = context?.contradictions && context.contradictions.length > 0
+      ? JSON.stringify(context.contradictions, null, 2)
+      : 'No automatic discrepancies flagged yet.';
+
+    const evaluationPrompt = `
+      You are a Principal Software Engineering Evaluator. Conduct an objective, evidence-driven technical evaluation of the candidate based on the interview transcript.
+      Do NOT evaluate on superficial confidence, generic warmth, or child-appropriate tutoring traits. Focus exclusively on technical competence, architectural depth, algorithmic correctness, hands-on implementation reality, and project ownership.
+
+      --------------------------------------------------
+      CONTEXT & EVIDENCE
+      --------------------------------------------------
+      Candidate GitHub Intelligence & Repositories:
+      ${githubContextStr}
+
+      Detected Contradictions / Evidence Gaps:
+      ${contradictionsStr}
+
+      --------------------------------------------------
+      📊 EVALUATION CRITERIA (1-10 Scale)
+      --------------------------------------------------
+      Provide a structured JSON output evaluating the candidate strictly on:
+      - technicalDepth (1-10 scale rating, plus detailed reasoning): understanding of internal mechanics, systems architecture, concurrency, memory/CPU scaling, failure modes, trade-offs, and design boundaries.
+      - systemArchitecture (1-10): ability to design scalable, distributed, resilient architectures, APIs, and data layers with clear trade-offs.
+      - problemSolving (1-10): structured problem decomposition, practical debugging approaches, edge-case consideration, algorithmic execution.
+      - codeQuality (1-10): best practices, clean code conventions, testability, security awareness, and engineering discipline.
+      - technicalCommunication (1-10): clear, precise, structured technical articulation without evasiveness, fluff, or buzzword soup.
+      - claimVerification (1-10): consistency between claimed resume/GitHub experience and actual demonstrated knowledge.
+
+      --------------------------------------------------
+      CRITICAL GITHUB VERIFICATION & CLAIM OWNERSHIP RULES
+      --------------------------------------------------
+      1. Inspect any questions where the interviewer probed the candidate's GitHub repositories, public projects, or claimed skills.
+      2. If any repository or project claimed in GitHub or Resume is unverified, OR if the candidate:
+         - Was unable to clearly explain how their claimed project was designed or implemented,
+         - Admitted unfamiliarity ("I didn't write that part", "I don't remember", "someone else built it"),
+         - Gave vague, generic, or evasive answers about their own code/architecture,
+         - Dodged the question entirely:
+         => YOU MUST:
+            a) Heavily penalize 'claimVerification' (score 1-3) and reduce 'technicalDepth'.
+            b) Add an explicit risk flag: "GITHUB DISCREPANCY: Unable to verify ownership or implementation details of claimed repository/project".
+            c) Mark 'githubVerificationSummary.verified' as false and list unverified items.
+            d) If the unverified project/skill is core to the position, set overallRecommendation to "FAIL" or "FLAGGED".
+
+      --------------------------------------------------
+      📏 SCORING GUIDELINES
+      --------------------------------------------------
+      10 = Principal / Staff Engineer (deep architectural mastery, exact trade-offs, verified ownership)
+      8 = Senior Engineer (solid hands-on execution, clear reasoning, verified project claims)
+      6 = Mid-level Engineer (functional knowledge, but shallow on internals or scaling)
+      4 = Junior / Inconsistent (struggles with architectural depth, vague explanations)
+      1-2 = Incompetent / Unverified (unable to answer questions, severe claim discrepancies)
+
+      IMPORTANT RULES ABOUT INTERVIEW COMPLETION:
+      - Candidate provided ${userMessageCount ?? 'an unknown number of'} responses in this transcript.
+      - EARLY TERMINATION: If candidate answered 5 or fewer questions, heavily penalize all scores (max 4) and set overallRecommendation to "FAIL".
+      - If 6-9 questions, note "Incomplete Interview" in riskFlags.
+
+      Return ONLY valid JSON in exactly this schema shape:
+      {
+        "technicalDepth": { "score": 8, "reasoning": "..." },
+        "systemArchitecture": { "score": 7, "reasoning": "..." },
+        "problemSolving": { "score": 8, "reasoning": "..." },
+        "codeQuality": { "score": 8, "reasoning": "..." },
+        "technicalCommunication": { "score": 8, "reasoning": "..." },
+        "claimVerification": { "score": 8, "reasoning": "..." },
+        "overallRecommendation": "PASS",
+        "evidenceQuotes": ["Verbatim quote 1", "Verbatim quote 2", "Verbatim quote 3"],
+        "technicalHighlights": ["Demonstrated deep understanding of PostgreSQL query planning and indexing"],
+        "riskFlags": ["none"],
+        "consistencyAnalysis": "Candidate demonstrated consistent technical depth across all probed competencies...",
+        "githubVerificationSummary": {
+          "hasGitHubClaim": true,
+          "verified": true,
+          "unverifiedItems": [],
+          "details": "Candidate accurately walked through repository architecture and trade-offs."
+        },
+        "teachingStyle": "systems-architect",
+        "clarity": { "score": 8, "reasoning": "..." },
+        "simplicity": { "score": 8, "reasoning": "..." },
+        "patience": { "score": 8, "reasoning": "..." },
+        "warmth": { "score": 7, "reasoning": "..." },
+        "fluency": { "score": 8, "reasoning": "..." },
+        "engagement": { "score": 8, "reasoning": "..." }
+      }
+    `;
+
+    try {
+      const response = await openai.chat.completions.create({
+        model: OPENAI_MODEL,
         messages: [
           { role: 'system', content: evaluationPrompt },
           ...messages
@@ -182,23 +339,45 @@ export class OpenAIService {
 
       const content = response.choices[0].message.content || '{}';
       const cleanContent = content.replace(/```json/g, '').replace(/```/g, '').trim();
-      return JSON.parse(cleanContent);
+      const parsed = JSON.parse(cleanContent);
+
+      // Guarantee backward compatibility mappings
+      parsed.clarity = parsed.clarity || parsed.technicalDepth || { score: 6, reasoning: "Evaluated" };
+      parsed.simplicity = parsed.simplicity || parsed.problemSolving || { score: 6, reasoning: "Evaluated" };
+      parsed.patience = parsed.patience || parsed.codeQuality || { score: 6, reasoning: "Evaluated" };
+      parsed.warmth = parsed.warmth || parsed.systemArchitecture || { score: 6, reasoning: "Evaluated" };
+      parsed.fluency = parsed.fluency || parsed.technicalCommunication || { score: 6, reasoning: "Evaluated" };
+      parsed.engagement = parsed.engagement || parsed.claimVerification || { score: 6, reasoning: "Evaluated" };
+      parsed.keyHighlights = parsed.keyHighlights || parsed.technicalHighlights || [];
+
+      return parsed;
     } catch (error) {
-      logger.error(`OpenAI Eval Error: ${error}`);
+      logger.error(`OpenAI Technical Eval Error: ${error}`);
       return {
-        clarity: { score: 5, reasoning: "Evaluation generation failed." },
-        simplicity: { score: 5, reasoning: "Evaluation generation failed." },
-        patience: { score: 5, reasoning: "Evaluation generation failed." },
-        warmth: { score: 5, reasoning: "Evaluation generation failed." },
-        fluency: { score: 5, reasoning: "Evaluation generation failed." },
-        engagement: { score: 5, reasoning: "Evaluation generation failed." },
-        overallRecommendation: "FAIL",
+        technicalDepth: { score: 5, reasoning: "Evaluation generation encountered a system error." },
+        systemArchitecture: { score: 5, reasoning: "Evaluation generation encountered a system error." },
+        problemSolving: { score: 5, reasoning: "Evaluation generation encountered a system error." },
+        codeQuality: { score: 5, reasoning: "Evaluation generation encountered a system error." },
+        technicalCommunication: { score: 5, reasoning: "Evaluation generation encountered a system error." },
+        claimVerification: { score: 5, reasoning: "Evaluation generation encountered a system error." },
+        clarity: { score: 5, reasoning: "Evaluation generation encountered a system error." },
+        simplicity: { score: 5, reasoning: "Evaluation generation encountered a system error." },
+        patience: { score: 5, reasoning: "Evaluation generation encountered a system error." },
+        warmth: { score: 5, reasoning: "Evaluation generation encountered a system error." },
+        fluency: { score: 5, reasoning: "Evaluation generation encountered a system error." },
+        engagement: { score: 5, reasoning: "Evaluation generation encountered a system error." },
+        overallRecommendation: "FLAGGED",
         evidenceQuotes: [],
-        teachingStyle: "unknown",
-        riskFlags: ["System fault"],
+        teachingStyle: "technical-evaluator",
+        riskFlags: ["System evaluation failure"],
         keyHighlights: [],
-        consistencyAnalysis: "Could not evaluate due to system error.",
-        communicationStyleAnalysis: { structure: "unknown", examplesUsed: false, stepByStep: false }
+        consistencyAnalysis: "Could not evaluate transcript due to a system error.",
+        githubVerificationSummary: {
+          hasGitHubClaim: false,
+          verified: false,
+          unverifiedItems: [],
+          details: "Could not perform automated verification due to an evaluation fault."
+        }
       };
     }
   }

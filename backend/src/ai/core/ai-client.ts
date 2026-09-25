@@ -55,8 +55,12 @@ export class AIClient {
     messages: ChatMessage[],
     options: CompletionOptions = {}
   ): Promise<string> {
-    const model = options.model || 'gpt-4o-mini';
+    const model = options.model || process.env.OPENAI_MODEL || (env as any).OPENAI_MODEL || 'gpt-4o-mini';
     const temperature = options.temperature ?? 0.3;
+
+    if (process.env.MOCK_AI === 'true' || !OPENAI_API_KEY || OPENAI_API_KEY.startsWith('mock-')) {
+      throw new Error('AI API call skipped in test/mock mode');
+    }
 
     try {
       const response = await openai.chat.completions.create({

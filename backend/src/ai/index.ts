@@ -20,3 +20,5 @@ export * from './interview/question-engine';
 
 export * from './evaluation/evaluation-schema';
 export * from './evaluation/evaluation-prompts';
+
+export * from './evidence';

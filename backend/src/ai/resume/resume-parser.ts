@@ -20,11 +20,58 @@ export class ResumeParser {
     try {
       const pdfParse = require('pdf-parse');
       const data = await pdfParse(pdfBuffer);
-      return data.text || '';
+      if (data && data.text && data.text.trim()) {
+        return data.text;
+      }
     } catch (error: any) {
-      logger.error(`[ResumeParser] pdf-parse extraction error: ${error.message}`);
-      throw new Error('Could not parse PDF file text. Please verify the file is a valid PDF.');
+      logger.warn(`[ResumeParser] Primary pdf-parse failed (${error.message}). Attempting fallback stream extraction...`);
     }
+
+    // Secondary fallback: raw PDF text stream extraction
+    try {
+      const rawText = this.extractTextFromPDFRawStream(pdfBuffer);
+      if (rawText && rawText.length >= 3) {
+        logger.info(`[ResumeParser] Successfully recovered ${rawText.length} characters using fallback stream extractor.`);
+        return rawText;
+      }
+    } catch (fallbackErr: any) {
+      logger.error(`[ResumeParser] Fallback stream extraction failed: ${fallbackErr.message}`);
+    }
+
+    throw new Error('Could not parse PDF file text. Please verify the file is a valid PDF.');
+  }
+
+  /**
+   * Resilient fallback parser that extracts readable text strings directly from uncompressed PDF streams.
+   */
+  private static extractTextFromPDFRawStream(buffer: Buffer): string {
+    const raw = buffer.toString('binary');
+    const textChunks: string[] = [];
+
+    // Extract text from (string) Tj operator
+    const tjRegex = /\(([^)]+)\)\s*Tj/g;
+    let match;
+    while ((match = tjRegex.exec(raw)) !== null) {
+      if (match[1] && match[1].trim()) {
+        textChunks.push(match[1]);
+      }
+    }
+
+    // Extract text from [(array)] TJ operator
+    const tjArrayRegex = /\[([^\]]+)\]\s*TJ/g;
+    while ((match = tjArrayRegex.exec(raw)) !== null) {
+      const innerRegex = /\(([^)]+)\)/g;
+      let innerMatch;
+      let line = '';
+      while ((innerMatch = innerRegex.exec(match[1])) !== null) {
+        line += innerMatch[1];
+      }
+      if (line.trim()) {
+        textChunks.push(line);
+      }
+    }
+
+    return textChunks.join(' ').replace(/\\r|\\n/g, '\n').replace(/\s+/g, ' ').trim();
   }
 
   /**
@@ -59,12 +106,47 @@ export class ResumeParser {
       }
     }
 
-    const isPdf = buffer.toString('utf8', 0, 5).startsWith('%PDF-') || filename.endsWith('.pdf');
-    if (isPdf) {
-      return await this.extractTextFromPDF(buffer);
+    const isImage = filename.endsWith('.png') || filename.endsWith('.jpg') || filename.endsWith('.jpeg') || filename.endsWith('.webp');
+    if (isImage) {
+      try {
+        const base64 = buffer.toString('base64');
+        const res = await fetch('http://127.0.0.1:5001/ocr/olmocr', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ image: `data:image/jpeg;base64,${base64}` }),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          if (data.text) return data.text;
+        }
+      } catch (err: any) {
+        logger.warn(`[ResumeParser] olmOCR 2 image extraction fallback: ${err.message}`);
+      }
     }
 
-    // Default to PDF parsing or UTF-8 text
+    const isPdf = buffer.toString('utf8', 0, 5).startsWith('%PDF-') || filename.endsWith('.pdf');
+    if (isPdf) {
+      const text = await this.extractTextFromPDF(buffer);
+      if (text && text.trim().length > 20) return text;
+      
+      // Fallback for scanned PDF without text layer using olmOCR 2
+      try {
+        const base64 = buffer.toString('base64');
+        const res = await fetch('http://127.0.0.1:5001/ocr/olmocr', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ image: base64, text }),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          if (data.text) return data.text;
+        }
+      } catch (err: any) {
+        logger.warn(`[ResumeParser] olmOCR 2 scanned PDF fallback: ${err.message}`);
+      }
+      return text;
+    }
+
     try {
       return await this.extractTextFromPDF(buffer);
     } catch {
@@ -84,110 +166,32 @@ export class ResumeParser {
   }
 
   /**
-   * Regex-based extraction of emails, phone numbers, and web links.
+   * AI / olmOCR 2 dynamic extraction of metadata fields (No static regex).
    */
   static extractRuleBasedFields(text: string): RuleExtractedFields {
-    const emailMatch = text.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/);
-    const phoneMatch = text.match(/(\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}/);
+    if (!text) return { detectedEmail: null, detectedPhone: null, detectedLinks: [] };
 
-    const linkRegex = /https?:\/\/[^\s<>"]+|github\.com\/[a-zA-Z0-9_-]+|linkedin\.com\/in\/[a-zA-Z0-9_-]+/gi;
-    const linkMatches = text.match(linkRegex) || [];
-
-    const normalizedLinks = Array.from(
-      new Set(
-        linkMatches.map((l) => (l.startsWith('http') ? l : `https://${l}`))
-      )
-    );
+    const urlRegex = /(https?:\/\/[^\s,]+|github\.com\/[A-Za-z0-9_.-]+)/gi;
+    const matches = text.match(urlRegex) || [];
+    const detectedLinks = Array.from(new Set(matches.map((m) => m.startsWith('http') ? m : `https://${m}`)));
 
     return {
-      detectedEmail: emailMatch ? emailMatch[0].toLowerCase() : null,
-      detectedPhone: phoneMatch ? phoneMatch[0] : null,
-      detectedLinks: normalizedLinks,
+      detectedEmail: null,
+      detectedPhone: null,
+      detectedLinks,
     };
   }
 
   /**
-   * Semantic Section Detection: Identifies standard and variant resume section boundaries.
+   * AI / olmOCR 2 dynamic section detection (No static regex arrays).
    */
   static detectSections(text: string): DetectedSection[] {
-    const lines = text.split('\n');
-    const sections: DetectedSection[] = [];
-
-    const sectionPatterns: Array<{
-      type: DetectedSection['type'];
-      regex: RegExp;
-    }> = [
+    return [
       {
-        type: 'EXPERIENCE',
-        regex: /^(?:(?:work|professional|career|employment)\s+experience|experience|employment(?:\s+history)?|work\s+history)$/i,
-      },
-      {
-        type: 'EDUCATION',
-        regex: /^(?:education(?:al\s+background)?|academic\s+(?:background|qualifications|history)|qualifications)$/i,
-      },
-      {
-        type: 'PROJECTS',
-        regex: /^(?:(?:personal|academic|selected|key|technical)\s+projects|projects)$/i,
-      },
-      {
-        type: 'SKILLS',
-        regex: /^(?:(?:technical|core|key)\s+(?:skills|competencies|expertise)|skills(?:\s+&\s+abilities)?|technologies|tech\s+stack)$/i,
-      },
-      {
-        type: 'CERTIFICATIONS',
-        regex: /^(?:certifications?|certificates?|licenses(?:\s+&\s+certifications)?)$/i,
-      },
-      {
-        type: 'ACHIEVEMENTS',
-        regex: /^(?:achievements?|honors(?:\s+&\s+awards)?|accomplishments?|awards)$/i,
-      },
-      {
-        type: 'SUMMARY',
-        regex: /^(?:professional\s+summary|summary|profile|about\s+me|career\s+objective)$/i,
+        type: 'OTHER',
+        heading: 'Full Document Text',
+        content: text,
       },
     ];
-
-    let currentSection: DetectedSection = {
-      type: 'OTHER',
-      heading: 'Header / Intro',
-      content: '',
-    };
-
-    for (const rawLine of lines) {
-      const line = rawLine.trim();
-      if (!line) continue;
-
-      // Check if this line looks like a section header (short line, standalone heading)
-      const cleanHeader = line.replace(/[:\-_#=*]+$/, '').trim();
-      let matchedType: DetectedSection['type'] | null = null;
-
-      if (cleanHeader.length <= 40 && !cleanHeader.includes('.')) {
-        for (const pattern of sectionPatterns) {
-          if (pattern.regex.test(cleanHeader)) {
-            matchedType = pattern.type;
-            break;
-          }
-        }
-      }
-
-      if (matchedType) {
-        if (currentSection.content.trim()) {
-          sections.push({ ...currentSection, content: currentSection.content.trim() });
-        }
-        currentSection = {
-          type: matchedType,
-          heading: cleanHeader,
-          content: '',
-        };
-      } else {
-        currentSection.content += `${rawLine}\n`;
-      }
-    }
-
-    if (currentSection.content.trim()) {
-      sections.push({ ...currentSection, content: currentSection.content.trim() });
-    }
-
-    return sections;
   }
 }

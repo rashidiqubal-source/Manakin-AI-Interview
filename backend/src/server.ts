@@ -24,9 +24,9 @@ const io = new Server(server, {
 
 setupSockets(io);
 
-const PORT = Number(env.PORT) || 3000;
+const PORT = env.PORT;
 
-server.listen(PORT, '0.0.0.0', async () => {
+server.listen(PORT, async () => {
   logger.info(`🚀 Server running in ${env.NODE_ENV} mode on port ${PORT}`);
   startKeepAlive();
   

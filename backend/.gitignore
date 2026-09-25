@@ -1,39 +1,9 @@
-# Node dependencies
-node_modules/
-
-# Environment variables
+node_modules
+# Keep environment variables out of version control
 .env
-.env.*
-!.env.example
 
-# Build & Prisma
 /src/generated/prisma
 dist/
 build/
 coverage/
-
-# Python Virtual Environments
-.venv/
-venv/
-env/
-ENV/
-
-# Python cache & compiled files
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-
-# ML Model Weights & Cache
-*.pt
-*.pth
-*.onnx
-.cache/
-
-# Audio temporary files
 temp_audio/
-
-# IDE & Agents
-.agent/
-.DS_Store
-

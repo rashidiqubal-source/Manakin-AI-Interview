@@ -1,5 +1,6 @@
 import { CanonicalNormalizedJD } from '../jd/jd-schema';
 import { CanonicalNormalizedResume } from '../resume/resume-schema';
+import { GitHubProfileAnalysis } from '../evidence/evidence-types';
 import {
   PersonalizedQuestion,
   QuestionGenerationPlan,
@@ -18,6 +19,7 @@ interface QuestionEngineInput {
   jd: CanonicalNormalizedJD;
   resume: CanonicalNormalizedResume;
   candidateName: string;
+  githubAnalysis?: GitHubProfileAnalysis;
 }
 
 export class QuestionEngine {
@@ -66,13 +68,79 @@ export class QuestionEngine {
    * Rule-based fallback question plan generator
    */
   private static generateFallbackPlan(input: QuestionEngineInput): QuestionGenerationPlan {
-    const { jd, resume, candidateName } = input;
+    const { jd, resume, candidateName, githubAnalysis } = input;
     const { overlapSkills, gapSkills } = this.analyzeOverlapAndGaps(jd, resume);
     const questions: PersonalizedQuestion[] = [];
+    const githubProjectSummary: string[] = [];
 
     let qIndex = 1;
 
-    // 1. Overlap questions (anchor to actual resume project/experience)
+    // 1. GitHub Project Architecture questions (probe what the candidate actually built)
+    const flagshipProjects = githubAnalysis?.canonicalSummary?.flagshipProjects || [];
+    const suggestedProbes = githubAnalysis?.canonicalSummary?.suggestedArchitectureProbes || [];
+
+    if (suggestedProbes.length > 0) {
+      for (const probe of suggestedProbes.slice(0, 2)) {
+        githubProjectSummary.push(`Grounded in repository '${probe.repoName}': ${probe.targetedSkill}`);
+        questions.push({
+          id: `q${qIndex++}`,
+          question: probe.question,
+          skill: probe.targetedSkill || 'System Architecture',
+          difficulty: 'HARD',
+          sources: ['JD_REQUIREMENT', 'GITHUB_PROJECT_ARCHITECTURE', 'RESUME_GITHUB_OVERLAP'],
+          rationale: probe.rationale || `Probes real production architecture from candidate repository '${probe.repoName}'.`,
+          suggestedEvaluationCriteria: [
+            'Articulates architectural trade-offs and design constraints',
+            'Explains concurrency, caching, or data persistence choices',
+            'Demonstrates deep code authorship and ownership',
+          ],
+          followUpProbes: [
+            'How would you refactor this architecture to handle a 10x surge in write traffic?',
+          ],
+          githubProject: probe.repoName,
+        });
+      }
+    } else if (flagshipProjects.length > 0) {
+      for (const proj of flagshipProjects.slice(0, 2)) {
+        githubProjectSummary.push(`Grounded in repository '${proj.repoName}': ${proj.endToEndArchitecture}`);
+        questions.push({
+          id: `q${qIndex++}`,
+          question: `In your repository '${proj.repoName}', you built an architecture featuring ${proj.endToEndArchitecture || proj.keyTechnologies.join(', ')}. How did you structure your component boundaries, data persistence, and error recovery in that project?`,
+          skill: proj.keyTechnologies[0] || proj.primaryLanguage,
+          difficulty: 'HARD',
+          sources: ['JD_REQUIREMENT', 'GITHUB_PROJECT_ARCHITECTURE'],
+          rationale: `Probes candidate's actual architecture and code decisions built in repository '${proj.repoName}'.`,
+          suggestedEvaluationCriteria: [
+            'Explains component interactions and failure modes',
+            'Demonstrates practical mastery of the chosen tech stack',
+          ],
+          followUpProbes: [
+            'What was the most challenging production bug or race condition you debugged in this repo?',
+          ],
+          githubProject: proj.repoName,
+          targetArchitecture: proj.endToEndArchitecture,
+        });
+      }
+    } else if (githubAnalysis?.analyzedRepos && githubAnalysis.analyzedRepos.length > 0) {
+      const topRepo = githubAnalysis.analyzedRepos[0];
+      githubProjectSummary.push(`Grounded in repository '${topRepo.repoName}' (${topRepo.language})`);
+      questions.push({
+        id: `q${qIndex++}`,
+        question: `In your GitHub repository '${topRepo.repoName}', you used ${topRepo.relevantTechnologies.join(', ') || topRepo.language}. Could you walk me through the end-to-end design and key trade-offs you made when building it?`,
+        skill: topRepo.language || 'Architecture',
+        difficulty: 'MEDIUM',
+        sources: ['JD_REQUIREMENT', 'GITHUB_PROJECT_ARCHITECTURE'],
+        rationale: `Directly examines code authored in public repo '${topRepo.repoName}'.`,
+        suggestedEvaluationCriteria: [
+          'Understands architecture and component roles',
+          'Discusses real trade-offs and code structure',
+        ],
+        followUpProbes: ['What would you improve if rebuilding this from scratch today?'],
+        githubProject: topRepo.repoName,
+      });
+    }
+
+    // 2. Overlap questions (anchor to actual resume project/experience)
     for (const skill of overlapSkills.slice(0, 3)) {
       const matchingResumeSkill = resume.skills.find((s) => s.name.toLowerCase() === skill.toLowerCase());
       const evidenceSnippet = matchingResumeSkill?.evidence?.[0] || 'your past work';
@@ -96,11 +164,11 @@ export class QuestionEngine {
       });
     }
 
-    // 2. Gap questions (test required skill candidate has not directly evidenced)
+    // 3. Gap questions (test required skill candidate has not directly evidenced)
     for (const skill of gapSkills.slice(0, 2)) {
       questions.push({
         id: `q${qIndex++}`,
-        question: `This role heavily requires ${skill}, which is critical for our team's upcoming deliverables. While your resume showcases strong foundational skills, how would you approach adopting and delivering production-grade solutions using ${skill}?`,
+        question: `This role heavily requires ${skill}, which is critical for our team's upcoming deliverables. While your background showcases strong foundational skills, how would you approach adopting and delivering production-grade solutions using ${skill}?`,
         skill,
         difficulty: 'HARD',
         sources: ['JD_REQUIREMENT', 'JD_GAP'],
@@ -115,7 +183,7 @@ export class QuestionEngine {
       });
     }
 
-    // 3. System Design / Responsibility question
+    // 4. System Design / Responsibility question
     if (jd.responsibilities[0]) {
       const resp = jd.responsibilities[0].description;
       questions.push({
@@ -135,7 +203,7 @@ export class QuestionEngine {
       });
     }
 
-    // 4. Behavioral question
+    // 5. Behavioral question
     const behavioralTrait = jd.candidateQualities.behavioral[0] || 'Problem Solving';
     questions.push({
       id: `q${qIndex++}`,
@@ -156,20 +224,22 @@ export class QuestionEngine {
     return {
       roleTitle: jd.job.title,
       candidateName,
-      summaryRationale: `Synthesized question plan balancing ${overlapSkills.length} overlap skills and ${gapSkills.length} identified gap areas.`,
+      summaryRationale: `Synthesized question plan balancing ${questions.filter(q => q.sources.includes('GITHUB_PROJECT_ARCHITECTURE')).length} GitHub architecture probes, ${overlapSkills.length} overlap skills, and ${gapSkills.length} identified gap areas.`,
       overlapSummary: overlapSkills.map((s) => `Direct overlap in ${s}`),
       gapSummary: gapSkills.map((s) => `Gap in stated evidence for ${s}`),
+      githubProjectSummary,
       questions,
     };
   }
 
   /**
-   * Generates a fully personalized interview question plan synthesized from both JD and Resume.
+   * Generates a fully personalized interview question plan synthesized from JD, Resume, and GitHub Ground Truth.
    */
   static async generateQuestions(
     jd: CanonicalNormalizedJD,
     resume: CanonicalNormalizedResume,
-    candidateName?: string
+    candidateName?: string,
+    githubAnalysis?: GitHubProfileAnalysis
   ): Promise<QuestionGenerationPlan> {
     const resolvedName = candidateName || resume.profile.name || 'Candidate';
     const { overlapSkills, gapSkills } = this.analyzeOverlapAndGaps(jd, resume);
@@ -178,7 +248,41 @@ export class QuestionEngine {
       jd,
       resume,
       candidateName: resolvedName,
+      githubAnalysis,
     };
+
+    const gh = input.githubAnalysis;
+    const ghSummary = gh?.canonicalSummary;
+
+    const githubContextText = gh
+      ? `
+========================
+3. CANDIDATE GITHUB ARCHITECTURE & GROUND TRUTH (WHAT CANDIDATE ACTUALLY BUILT)
+========================
+Username: @${gh.username} (${gh.analyzedRepos.length} public repos analyzed)
+Archetype: ${ghSummary?.primaryArchetype || 'Software Engineer'}
+Executive Architecture Summary: ${ghSummary?.executiveSummary || 'Repositories analyzed.'}
+
+Flagship Projects & Architectures Actually Built:
+${(ghSummary?.flagshipProjects || []).map((p) => `• Repository "${p.repoName}" (${p.primaryLanguage}, Maturity: ${p.codeMaturity}):
+   Architecture Pipeline: ${p.endToEndArchitecture}
+   Key Technologies: ${p.keyTechnologies.join(', ')}
+   Design Patterns: ${p.designPatterns.join(', ') || 'Standard MVC'}
+   Testing Discipline: ${p.hasTests ? 'Unit/Integration Tests Present' : 'No tests found'} | Docker: ${p.hasDocker} | CI/CD: ${p.hasCiCd}
+   Key Architectural Decisions: ${p.verifiedArchitecturalDecisions.join('; ') || 'Standard implementation'}`).join('\n\n') || gh.analyzedRepos.map(r => `• Repo "${r.repoName}" (${r.language}): ${r.description} [Techs: ${r.relevantTechnologies.join(', ')}]`).join('\n')}
+
+Verified Technologies in Code:
+${(ghSummary?.verifiedTechnologies || []).map((v) => `• ${v.technology} (${v.depth}) in repos: ${v.repos.join(', ')}`).join('\n') || gh.topTechnologies.join(', ')}
+
+Suggested Architectural Probe Questions from Ground Truth Code:
+${(ghSummary?.suggestedArchitectureProbes || []).map((p) => `• [Target Repo: "${p.repoName}", Skill: ${p.targetedSkill}] Question: "${p.question}" (Rationale: ${p.rationale})`).join('\n') || 'None pre-computed'}
+`
+      : `
+========================
+3. CANDIDATE GITHUB EVIDENCE
+========================
+No public GitHub profile provided. Focus on JD requirements and Resume project claims.
+`;
 
     return await PromptRunner.execute(
       {
@@ -191,7 +295,7 @@ export class QuestionEngine {
       },
       input,
       (inp) => `
-Analyze the Recruiter JD and Candidate Resume to generate personalized interview questions:
+Analyze the Recruiter JD, Candidate Resume, and GitHub Ground Truth to generate personalized interview questions:
 
 ========================
 1. RECRUITER JOB REQUIREMENTS (WHAT TO TEST)
@@ -219,13 +323,16 @@ ${inp.resume.projects.map((p) => `• Project "${p.name}" (${p.technologies.join
 Experience History:
 ${inp.resume.experience.map((e) => `• ${e.role} at ${e.company} (${e.duration}): ${e.highlights.join('; ')}`).join('\n')}
 
+${githubContextText}
+
 ========================
 PRE-COMPUTED OVERLAP & GAPS
 ========================
 Overlap Skills: ${overlapSkills.join(', ') || 'None direct'}
 Gap Skills: ${gapSkills.join(', ') || 'None direct'}
 
-Synthesize at least 5 to 7 personalized questions following the schema. Ensure EVERY question has source classification, rationale, and evaluation criteria.
+CRITICAL INSTRUCTION:
+Generate at least 5 to 7 personalized questions. If GitHub evidence was provided, at least 2 questions MUST directly probe what the candidate actually built in their GitHub repositories (citing repo name, architecture, trade-offs, and technical choices). Tag those questions with 'GITHUB_PROJECT_ARCHITECTURE' or 'RESUME_GITHUB_OVERLAP'.
 `
     );
   }

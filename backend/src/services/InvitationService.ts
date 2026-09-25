@@ -70,6 +70,48 @@ export class InvitationService {
       throw new AppError('Invalid or expired interview link token', 404);
     }
 
+    // If applicantId is not linked yet, automatically find or create candidate user without requiring login
+    if (!invitation.applicantId) {
+      let candidateUser = await prisma.user.findUnique({
+        where: { email: invitation.applicantEmail.toLowerCase().trim() },
+      });
+
+      if (!candidateUser) {
+        candidateUser = await prisma.user.create({
+          data: {
+            email: invitation.applicantEmail.toLowerCase().trim(),
+            name: invitation.applicantEmail.split('@')[0],
+            role: 'APPLICANT',
+            emailVerified: true,
+          },
+        });
+      }
+
+      const updated = await prisma.interviewInvitation.update({
+        where: { id: invitation.id },
+        data: {
+          applicantId: candidateUser.id,
+          status: invitation.status === 'PENDING' ? 'ACCEPTED' : invitation.status,
+        },
+        include: {
+          jobDescription: {
+            select: { id: true, title: true, aiSummary: true, aiAnalysis: true },
+          },
+          applicant: {
+            select: { id: true, email: true, name: true },
+          },
+          applicantResume: {
+            select: { id: true, fileName: true, aiSummary: true, aiAnalysis: true, createdAt: true },
+          },
+          interviewSession: {
+            select: { id: true, status: true, applicationStatus: true },
+          },
+        },
+      });
+
+      return updated;
+    }
+
     return invitation;
   }
 

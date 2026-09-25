@@ -1,5 +1,7 @@
 # Smart Resume Intelligence Pipeline — CS Interview Platform
 
+> 📖 **Related Overview Document**: [Applicant Resume Intelligence & Evidence Preservation Specification](./resume-analysis.md)
+
 ## 1. Overall Architecture
 
 The Smart Resume Understanding Pipeline is specifically engineered for **Computer Science and Software Engineering interviews** (Software Engineer, Backend, Frontend, Full Stack, AI/ML, Data Engineer, DevOps/Cloud, SRE, Mobile, Security, QA/Automation, and CS Internship roles).

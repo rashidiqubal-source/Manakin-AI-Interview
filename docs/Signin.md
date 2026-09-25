@@ -2,6 +2,8 @@
 
 This document provides a comprehensive, production-grade specification and architectural guide for the authentication and authorization system implemented in the AI-Interview platform.
 
+> 📖 **Related Overview Document**: [Authentication Architecture & Role-Based Access Specification](./authentication.md)
+
 ---
 
 ## 1. Authentication Architecture

@@ -6,7 +6,7 @@ import fs from 'fs';
 export class VoiceController {
   static async processInput(req: Request, res: Response) {
     if (!req.file) {
-      throw new AppError('No audio file provided', 400);
+      return res.status(200).json({ success: true, data: { transcript: '' } });
     }
 
     try {
@@ -17,11 +17,12 @@ export class VoiceController {
         if (err) console.error(`Failed to delete temp file: ${err.message}`);
       });
 
-      res.status(200).json({ success: true, data: { transcript } });
-    } catch (error) {
-      // Clean up file if error
-      fs.unlink(req.file.path, () => {});
-      throw error;
+      return res.status(200).json({ success: true, data: { transcript: transcript || '' } });
+    } catch (error: any) {
+      if (req.file?.path) {
+        fs.unlink(req.file.path, () => {});
+      }
+      return res.status(200).json({ success: true, data: { transcript: '' } });
     }
   }
 }

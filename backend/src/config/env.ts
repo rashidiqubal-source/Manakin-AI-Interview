@@ -22,6 +22,7 @@ const envSchema = z.object({
   PORT: z.string().default('3000'),
   DATABASE_URL: z.string().url('Invalid Database URL format'),
   OPENAI_API_KEY: z.string().min(1, 'OpenAI API Key is required'),
+  OPENAI_MODEL: z.string().default('gpt-4o-mini'),
   CORS_ORIGIN: z.string().default('http://localhost:3001'),
   FRONTEND_URL: z.string().default('http://localhost:3001'),
   SESSION_COOKIE_NAME: z.string().default('ai_interview_session'),
@@ -39,7 +40,13 @@ const envSchema = z.object({
   MAILERO_USERNAME: z.string().optional(),
   MAILERO_PASSWORD: z.string().optional(),
   MAILERO_SENDING_KEY: z.string().optional(),
-  MAILERO_FROM: z.string().default('"AI Interview Platform" <careers@example.com>'),
+  MAILERO_FROM: z.string()
+    .default('AI Interview Platform <careers@example.com>')
+    .transform((val) => val.replace(/\\"/g, '"').trim()),
+  AWS_REGION: z.string().default('ap-south-1'),
+  AWS_ACCESS_KEY_ID: z.string().optional(),
+  AWS_SECRET_ACCESS_KEY: z.string().optional(),
+  AWS_S3_BUCKET: z.string().optional(),
 });
 
 const _env = envSchema.safeParse(process.env);

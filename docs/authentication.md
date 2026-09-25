@@ -1,8 +1,10 @@
 # Authentication Architecture & Role-Based Access Specification
 
+> 📖 **Related Deep-Dive Document**: [Production-Grade Authentication & Security Specification](./Signin.md)
+
 ## 1. Overview
 
-The AI Interview Platform implements a centralized, production-grade native authentication architecture. It provides role-specific registration paths for **Applicants** and **Recruiters** while strictly routing all sign-in attempts through a single, unified authentication pipeline.
+The AI Interview Platform implements a centralized, production-grade native authentication architecture. It provides role-specific registration paths for **Applicants** (`/auth/signup/applicant`) and **Recruiters** (`/auth/signup/recruiter`) while strictly routing all sign-in attempts through a single, unified authentication pipeline (`/auth/signin`).
 
 ```mermaid
 flowchart TD
@@ -48,13 +50,15 @@ flowchart TD
   {
     "success": true,
     "message": "Registration successful. A verification email has been sent to your address.",
-    "user": {
-      "id": "c1f7a0c8-4720-4e50-9d0a-e45f949c5123",
-      "email": "applicant@example.com",
-      "name": "Jane Doe",
-      "role": "APPLICANT",
-      "emailVerified": false,
-      "createdAt": "2026-09-03T02:50:00.000Z"
+    "data": {
+      "user": {
+        "id": "c1f7a0c8-4720-4e50-9d0a-e45f949c5123",
+        "email": "applicant@example.com",
+        "name": "Jane Doe",
+        "role": "APPLICANT",
+        "emailVerified": false,
+        "createdAt": "2026-09-03T02:50:00.000Z"
+      }
     }
   }
   ```
@@ -75,13 +79,15 @@ flowchart TD
   {
     "success": true,
     "message": "Registration successful. A verification email has been sent to your address.",
-    "user": {
-      "id": "b8a91c20-7210-4f51-8a9b-d72b849c9981",
-      "email": "recruiter@techcorp.com",
-      "name": "Alex Smith",
-      "role": "RECRUITER",
-      "emailVerified": false,
-      "createdAt": "2026-09-03T02:50:00.000Z"
+    "data": {
+      "user": {
+        "id": "b8a91c20-7210-4f51-8a9b-d72b849c9981",
+        "email": "recruiter@techcorp.com",
+        "name": "Alex Smith",
+        "role": "RECRUITER",
+        "emailVerified": false,
+        "createdAt": "2026-09-03T02:50:00.000Z"
+      }
     }
   }
   ```
@@ -102,29 +108,34 @@ flowchart TD
   {
     "success": true,
     "message": "Signed in successfully",
-    "user": {
-      "id": "b8a91c20-7210-4f51-8a9b-d72b849c9981",
-      "email": "recruiter@techcorp.com",
-      "name": "Alex Smith",
-      "role": "RECRUITER",
-      "emailVerified": false,
-      "createdAt": "2026-09-03T02:50:00.000Z",
-      "updatedAt": "2026-09-03T02:50:00.000Z"
-    },
-    "accessToken": "3f90e8a71b4c92...",
     "data": {
       "user": {
         "id": "b8a91c20-7210-4f51-8a9b-d72b849c9981",
         "email": "recruiter@techcorp.com",
         "name": "Alex Smith",
         "role": "RECRUITER",
-        "emailVerified": false
-      },
-      "accessToken": "3f90e8a71b4c92..."
+        "emailVerified": false,
+        "createdAt": "2026-09-03T02:50:00.000Z",
+        "updatedAt": "2026-09-03T02:50:00.000Z"
+      }
     }
   }
   ```
 - **Cookie Set**: `Set-Cookie: ai_interview_session=<token>; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=604800`
+
+### 2.4 User Signout
+- **Endpoint**: `POST /api/v1/auth/signout`
+- **Description**: Invalidates the active server-side session and clears the session cookie.
+
+### 2.5 Profile Retrieval (`me`)
+- **Endpoint**: `GET /api/v1/auth/me`
+- **Description**: Returns the authenticated user record from the active session.
+
+### 2.6 Email Verification & Password Recovery
+- `POST /api/v1/auth/verify-email`
+- `POST /api/v1/auth/resend-verification`
+- `POST /api/v1/auth/forgot-password`
+- `POST /api/v1/auth/reset-password`
 
 ---
 

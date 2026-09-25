@@ -1,12 +1,17 @@
 import { Router } from 'express';
+import multer from 'multer';
 import { prisma } from '../../config/prisma';
 import { AppError } from '../../utils/AppError';
 import { JDAnalysisService } from '../../services/JDAnalysisService';
+import { ResumeParser } from '../../ai/resume/resume-parser';
+import { JDStageAnalyzer } from '../../ai/jd/jd-stage-analyzer';
 import { InvitationService } from '../../services/InvitationService';
+import { InterviewService } from '../../services/InterviewService';
 import { optionalAuth } from '../../middlewares/requireAuth';
 
 const router = Router();
 router.use(optionalAuth);
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 
 /**
  * Helper to resolve recruiter user from session context or provided ID
@@ -227,6 +232,63 @@ router.post('/jd/upload', async (req, res, next) => {
 });
 
 /**
+ * POST /api/v1/recruiter/jd/upload-file
+ * Upload JD file (PDF, DOCX, TXT) -> Extract text via ResumeParser -> AI JD Analysis -> DB
+ */
+router.post('/jd/upload-file', upload.single('file'), async (req, res, next) => {
+  try {
+    const { recruiterId, userId, title } = req.body;
+    const file = req.file;
+
+    if (!file) {
+      throw new AppError('Job description file (PDF/DOCX/TXT) is required', 400);
+    }
+
+    const recruiter = await resolveRecruiter(req, recruiterId || userId);
+    const extractedContent = await ResumeParser.extractText(file.buffer, file.originalname);
+    const jdTitle = title || file.originalname.replace(/\.[^/.]+$/, '');
+
+    const analysis = await JDAnalysisService.analyzeQuickPasteJD(extractedContent, jdTitle);
+    const norm = analysis.normalizedJD;
+
+    const jd = await prisma.jobDescription.create({
+      data: {
+        recruiterId: recruiter.id,
+        title: jdTitle || norm.job.title,
+        rawContent: extractedContent,
+        aiSummary: analysis.aiSummary,
+        aiAnalysis: analysis.aiAnalysis as any,
+        normalizedJD: norm as any,
+        interviewBlueprint: analysis.interviewBlueprint as any,
+        contentHash: analysis.contentHash,
+        analysisVersion: 'v2',
+        department: norm.job.department,
+        jobLevel: norm.job.level,
+        employmentType: norm.job.employmentType,
+        openings: norm.job.openings,
+        location: norm.job.location,
+        workMode: norm.job.workMode,
+        shortSummary: norm.role.summary,
+        responsibilities: norm.responsibilities.map((r) => r.description),
+        requiredSkills: norm.requiredSkills as any,
+        preferredSkills: norm.preferredSkills.map((s) => s.name) as any,
+        minExperience: norm.experience.minimumYears,
+        maxExperience: norm.experience.maximumYears,
+        freshersAllowed: norm.experience.freshersAllowed,
+        minEducation: norm.education.minimumLevel,
+        candidateQualities: norm.candidateQualities.behavioral.join(', '),
+        languagesRequired: norm.candidateQualities.languages as any,
+        isDraft: false,
+      },
+    });
+
+    return res.status(201).json({ status: 'success', data: jd });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
  * GET /api/v1/recruiter/jd/:id/blueprint
  * Get Interview Blueprint & Normalized JD for a specific job opening
  */
@@ -331,6 +393,155 @@ router.get('/invitations/:recruiterId', async (req, res, next) => {
     });
 
     return res.status(200).json({ status: 'success', data: invitations });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * POST /api/v1/recruiter/jd/upload-stage1
+ * Stage 1: Upload JD file/text -> olmOCR 2 -> Markdown -> OpenAI Stage 1 Analysis + Clarification Questions
+ */
+router.post('/jd/upload-stage1', upload.single('file'), async (req, res, next) => {
+  try {
+    const { recruiterId, userId, title, content } = req.body;
+    const file = req.file;
+
+    const recruiter = await resolveRecruiter(req, recruiterId || userId);
+
+    let extractedMarkdown = '';
+    let jdTitle = title || '';
+
+    if (file) {
+      extractedMarkdown = await ResumeParser.extractText(file.buffer, file.originalname);
+      if (!jdTitle) jdTitle = file.originalname.replace(/\.[^/.]+$/, '');
+    } else if (content) {
+      extractedMarkdown = content;
+    } else {
+      throw new AppError('Job description file or content is required', 400);
+    }
+
+    if (!jdTitle) jdTitle = 'Untitled Job Opening';
+
+    // Call 1: Analyze Markdown and generate questions if ambiguous
+    const stage1Result = await JDStageAnalyzer.analyzeMarkdownJD(extractedMarkdown);
+
+    const processingStatus = stage1Result.needsClarification ? 'NEEDS_CLARIFICATION' : 'COMPLETED';
+
+    const jd = await prisma.jobDescription.create({
+      data: {
+        recruiterId: recruiter.id,
+        title: jdTitle,
+        rawContent: extractedMarkdown,
+        extractedMarkdown,
+        initialStructuredJD: stage1Result.structuredJD as any,
+        clarificationQuestions: stage1Result.questions as any,
+        finalStructuredJD: stage1Result.needsClarification ? null : (stage1Result.structuredJD as any),
+        processingStatus,
+        isDraft: false,
+      },
+    });
+
+    return res.status(201).json({
+      status: 'success',
+      data: {
+        id: jd.id,
+        title: jd.title,
+        processingStatus,
+        questionCount: stage1Result.questionCount,
+        questions: stage1Result.questions,
+        initialStructuredJD: stage1Result.structuredJD,
+        extractedMarkdown,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * POST /api/v1/recruiter/jd/stage2-finalize
+ * Stage 2: Submit ALL recruiter clarification answers in ONE step -> OpenAI Final Structured JD -> DB Persistence
+ */
+router.post('/jd/stage2-finalize', async (req, res, next) => {
+  try {
+    const { recruiterId, userId, jobDescriptionId, answers } = req.body;
+
+    const recruiter = await resolveRecruiter(req, recruiterId || userId);
+
+    if (!jobDescriptionId || !Array.isArray(answers)) {
+      throw new AppError('jobDescriptionId and answers array are required', 400);
+    }
+
+    const jd = await prisma.jobDescription.findUnique({
+      where: { id: jobDescriptionId },
+    });
+
+    if (!jd || jd.recruiterId !== recruiter.id) {
+      throw new AppError('Job Description not found or unauthorized', 404);
+    }
+
+    const initialJD = (jd.initialStructuredJD as any) || {};
+    const questions = (jd.clarificationQuestions as any) || [];
+
+    // Call 2: OpenAI finalization using answers
+    const finalStructuredJD = await JDStageAnalyzer.finalizeStructuredJD(initialJD, questions, answers);
+
+    const updatedJD = await prisma.jobDescription.update({
+      where: { id: jd.id },
+      data: {
+        recruiterAnswers: answers as any,
+        finalStructuredJD: finalStructuredJD as any,
+        processingStatus: 'COMPLETED',
+      },
+    });
+
+    return res.status(200).json({
+      status: 'success',
+      data: updatedJD,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * GET /api/v1/recruiter/interview/:id/evidence-report
+ * Get complete Explainable Candidate Report (Candidate Evidence Profile, Q&A Transcript with silence latency, Eye Movement Gaze Stability, YOLO phone/out-of-screen counts, Evidence Graph)
+ */
+router.get('/interview/:id/evidence-report', async (req, res, next) => {
+  try {
+    const id = typeof req.params.id === 'string' ? req.params.id : req.params.id?.[0];
+    if (!id) throw new AppError('Session ID required', 400);
+    const report = await InterviewService.getExplainableReport(id as string);
+
+    const session = await prisma.interviewSession.findUnique({
+      where: { id: id as string },
+      include: {
+        invitation: {
+          include: {
+            jobDescription: true,
+            applicantResume: true,
+          },
+        },
+      },
+    });
+
+    return res.status(200).json({
+      status: 'success',
+      data: {
+        ...report,
+        evidenceGraph: session?.evidenceGraph,
+        evidenceGaps: session?.evidenceGaps,
+        verifiedClaims: session?.verifiedClaims,
+        contradictions: session?.contradictions,
+        githubEvidence: session?.githubEvidence,
+        aiFluency: session?.aiFluency,
+        evidenceReport: session?.evidenceReport,
+        evaluationData: session?.evaluationData,
+        jobTitle: session?.invitation?.jobDescription?.title || report.jobTitle,
+      },
+    });
   } catch (error) {
     next(error);
   }

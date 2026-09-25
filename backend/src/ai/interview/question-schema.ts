@@ -3,6 +3,9 @@ import { z } from 'zod';
 export const normalizeSource = (val: unknown): string => {
   if (typeof val !== 'string') return 'JD_REQUIREMENT';
   const u = val.toUpperCase().trim();
+  if (u.includes('GITHUB') && u.includes('PROJECT')) return 'GITHUB_PROJECT_ARCHITECTURE';
+  if (u.includes('GITHUB') || u.includes('REPO')) return 'GITHUB_PROJECT_ARCHITECTURE';
+  if (u.includes('RESUME_GITHUB') || (u.includes('RESUME') && u.includes('GITHUB'))) return 'RESUME_GITHUB_OVERLAP';
   if (u.includes('OVERLAP')) return 'JD_RESUME_OVERLAP';
   if (u.includes('GAP')) return 'JD_GAP';
   if (u.includes('FOLLOW')) return 'FOLLOW_UP';
@@ -10,6 +13,7 @@ export const normalizeSource = (val: unknown): string => {
   if (u.includes('PROJECT')) return 'RESUME_PROJECT';
   if (u.includes('EXPERIENCE')) return 'RESUME_EXPERIENCE';
   if (u.includes('RESUME') && u.includes('SKILL')) return 'RESUME_SKILL';
+  if (u.includes('RESUME')) return 'RESUME_PROJECT';
   if (u.includes('RESPONSIBIL')) return 'JD_RESPONSIBILITY';
   if (u.includes('DOMAIN')) return 'JD_DOMAIN';
   if (u.includes('JD') || u.includes('REQUIRE')) return 'JD_REQUIREMENT';
@@ -27,6 +31,8 @@ export const QuestionSourceEnum = z.preprocess(
     'RESUME_EXPERIENCE',
     'JD_RESUME_OVERLAP',
     'JD_GAP',
+    'GITHUB_PROJECT_ARCHITECTURE',
+    'RESUME_GITHUB_OVERLAP',
     'FOLLOW_UP',
     'BEHAVIORAL',
   ])
@@ -58,6 +64,8 @@ export const PersonalizedQuestionSchema = z.object({
   rationale: z.string(),
   suggestedEvaluationCriteria: z.array(z.string()).default([]),
   followUpProbes: z.array(z.string()).default([]),
+  githubProject: z.string().optional(),
+  targetArchitecture: z.string().optional(),
 });
 
 export type PersonalizedQuestion = z.infer<typeof PersonalizedQuestionSchema>;
@@ -68,6 +76,7 @@ export const QuestionGenerationPlanSchema = z.object({
   summaryRationale: z.string().default(''),
   overlapSummary: z.array(z.string()).default([]),
   gapSummary: z.array(z.string()).default([]),
+  githubProjectSummary: z.array(z.string()).default([]),
   questions: z.array(PersonalizedQuestionSchema),
 });
 
