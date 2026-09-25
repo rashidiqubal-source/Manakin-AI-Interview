@@ -11,6 +11,7 @@ import { logger } from './config/logger';
 import apiV1Routes from './routes/v1';
 import { errorHandler } from './middlewares/errorHandler';
 import { csrfProtection } from './middlewares/csrf';
+import { AppError } from './utils/AppError';
 
 import mlRoutes from './ml/routes/mlRoutes';
 
@@ -39,16 +40,36 @@ app.use(
 );
 
 // Secure CORS configuration supporting credentials (cookies)
-const allowedOrigins = env.CORS_ORIGIN === '*'
-  ? true
-  : env.CORS_ORIGIN.split(',').map((o) => o.trim());
+const allowedOriginsList = new Set<string>();
+[
+  ...env.CORS_ORIGIN.split(','),
+  ...env.FRONTEND_URL.split(','),
+  'https://manakin-ai-interview.vercel.app',
+  'http://localhost:3000',
+  'http://localhost:3001',
+].forEach((item) => {
+  const trimmed = item.trim();
+  if (trimmed) allowedOriginsList.add(trimmed);
+});
 
 app.use(
   cors({
-    origin: allowedOrigins,
+    origin: (requestOrigin, callback) => {
+      if (!requestOrigin || env.CORS_ORIGIN === '*') {
+        return callback(null, true);
+      }
+      if (
+        allowedOriginsList.has(requestOrigin) ||
+        (requestOrigin.endsWith('.vercel.app') &&
+          (requestOrigin.includes('manakin-ai-interview') || requestOrigin.includes('ai-interview')))
+      ) {
+        return callback(null, true);
+      }
+      return callback(new AppError('Not allowed by CORS', 403));
+    },
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'X-CSRF-Token'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'X-CSRF-Token', 'Accept'],
   })
 );
 

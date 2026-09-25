@@ -11,12 +11,11 @@ async function fetchWithRetry(url: string, options: RequestOptions = {}): Promis
 
   fetchOptions.credentials = 'include';
 
-  if (!(fetchOptions.body instanceof FormData)) {
-    fetchOptions.headers = {
-      'Content-Type': 'application/json',
-      ...fetchOptions.headers,
-    };
-  }
+  fetchOptions.headers = {
+    'X-Requested-With': 'XMLHttpRequest',
+    ...(fetchOptions.body instanceof FormData ? {} : { 'Content-Type': 'application/json' }),
+    ...fetchOptions.headers,
+  };
 
   let attempt = 0;
   while (true) {

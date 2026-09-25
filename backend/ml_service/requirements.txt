@@ -12,6 +12,6 @@ ultralytics>=8.3.0
 fastapi>=0.115.0
 uvicorn>=0.34.0
 pillow>=10.4.0
-numpy>=1.26.4
-opencv-python-headless>=4.10.0.84
+numpy==1.26.4
+opencv-python-headless==4.10.0.84
 huggingface_hub>=0.25.2
